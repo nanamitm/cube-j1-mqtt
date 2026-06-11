@@ -10,6 +10,8 @@ import zipfile
 
 PACKAGE_NAME = "cube-j1-mqtt"
 PACKAGE_FORMAT = 1
+DEVICE = "cube-j1"
+MIN_INSTALLER_FORMAT = 1
 
 FILES = [
     {
@@ -50,7 +52,9 @@ def build_manifest(root, version):
 
     return {
         "name": PACKAGE_NAME,
+        "device": DEVICE,
         "format": PACKAGE_FORMAT,
+        "min_installer_format": MIN_INSTALLER_FORMAT,
         "version": version,
         "files": files,
         "restart": [

@@ -38,7 +38,9 @@ OTA_UPLOAD_PATH = "/data/local/cube-j1-mqtt-update.zip"
 OTA_STAGING_DIR = "/data/local/ota_staging"
 OTA_APPLY_SCRIPT = "/data/local/apply_ota_update.sh"
 OTA_VERSION_PATH = "/data/local/cube-j1-mqtt.version"
+OTA_LOG_PATH = "/data/local/ota_apply.log"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
+MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
 OTA_ALLOWED_TARGETS = {
     "/data/local/mqtt_bridge.py": "mqtt_bridge.py",
@@ -126,6 +128,25 @@ def save_config(cfg):
         raise
 
 
+def validate_config_values(cfg):
+    errors = []
+    for key in INT_FIELDS:
+        try:
+            cfg[key] = int(cfg.get(key, 0))
+        except Exception:
+            errors.append("{} must be a number".format(key))
+
+    if cfg.get("web_port", 0) < 1 or cfg.get("web_port", 0) > 65535:
+        errors.append("web_port must be between 1 and 65535")
+    if cfg.get("mqtt_port", 0) < 1 or cfg.get("mqtt_port", 0) > 65535:
+        errors.append("mqtt_port must be between 1 and 65535")
+    if cfg.get("poll_interval", 0) < 1:
+        errors.append("poll_interval must be greater than 0")
+    if not str(cfg.get("web_user", "")):
+        errors.append("web_user must not be empty")
+    return errors
+
+
 def now_str():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -172,6 +193,20 @@ def load_current_version():
         return ""
 
 
+def load_ota_log(max_bytes=8192):
+    try:
+        size = os.path.getsize(OTA_LOG_PATH)
+        with open(OTA_LOG_PATH, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        if not isinstance(data, str):
+            data = data.decode("utf-8", "replace")
+        return data
+    except Exception:
+        return ""
+
+
 def is_safe_zip_name(name):
     if not name or name.startswith("/") or "\\" in name or ":" in name:
         return False
@@ -208,6 +243,10 @@ def validate_ota_package(package_path):
             raise ValueError("Unsupported package name")
         if int(manifest.get("format", 0)) != 1:
             raise ValueError("Unsupported package format")
+        if manifest.get("device") not in (None, "cube-j1"):
+            raise ValueError("Unsupported device")
+        if manifest.get("min_installer_format") not in (None, 1):
+            raise ValueError("Installer is too old for this package")
         version = str(manifest.get("version", ""))
         if not validate_version(version):
             raise ValueError("Invalid package version")
@@ -286,13 +325,23 @@ def start_ota_apply(manifest):
     version = str(manifest.get("version", ""))
     lines = [
         "#!/system/bin/sh",
-        "LOG=/data/local/ota_apply.log",
+        "LOG={}".format(shell_quote(OTA_LOG_PATH)),
         "STATUS={}".format(shell_quote(OTA_STATUS_PATH)),
+        "RESTORE_LIST=\"\"",
+        "restore_backups() {",
+        "  for TARGET in $RESTORE_LIST; do",
+        "    if [ -f \"$TARGET.bak\" ]; then",
+        "      cp \"$TARGET.bak\" \"$TARGET\"",
+        "      chmod 755 \"$TARGET\"",
+        "    fi",
+        "  done",
+        "}",
         "fail() {",
         "  MSG=\"$1\"",
         "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] apply failed: $MSG\" >> $LOG",
+        "  restore_backups",
         "  cat > $STATUS <<JSON",
-        "{\"state\":\"failed\",\"message\":\"OTA apply failed: $MSG\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + version + "\"}",
+        "{\"state\":\"rolled_back\",\"message\":\"OTA apply failed and rollback was attempted: $MSG\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + version + "\"}",
         "JSON",
         "  start mqtt_ha_bridge >/dev/null 2>&1",
         "  exit 1",
@@ -312,6 +361,8 @@ def start_ota_apply(manifest):
         staged = os.path.join(OTA_STAGING_DIR, rel_path)
         tmp_target = install_to + ".ota"
         lines.extend([
+            "cp {} {} || fail {}".format(shell_quote(install_to), shell_quote(install_to + ".bak"), shell_quote("backup " + rel_path)),
+            "RESTORE_LIST=\"$RESTORE_LIST {}\"".format(install_to),
             "cp {} {} || fail {}".format(shell_quote(staged), shell_quote(tmp_target), shell_quote("copy " + rel_path)),
             "chmod {} {} || fail {}".format(mode, shell_quote(tmp_target), shell_quote("chmod " + rel_path)),
             "mv {} {} || fail {}".format(shell_quote(tmp_target), shell_quote(install_to), shell_quote("install " + rel_path)),
@@ -329,6 +380,50 @@ def start_ota_apply(manifest):
         "start cubej_config_server >/dev/null 2>&1",
     ])
 
+    with open(OTA_APPLY_SCRIPT, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(OTA_APPLY_SCRIPT, 0o755)
+    os.system("/system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(OTA_APPLY_SCRIPT)))
+
+
+def start_ota_rollback():
+    lines = [
+        "#!/system/bin/sh",
+        "LOG={}".format(shell_quote(OTA_LOG_PATH)),
+        "STATUS={}".format(shell_quote(OTA_STATUS_PATH)),
+        "fail() {",
+        "  MSG=\"$1\"",
+        "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback failed: $MSG\" >> $LOG",
+        "  cat > $STATUS <<JSON",
+        "{\"state\":\"failed\",\"message\":\"Manual rollback failed: $MSG\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + load_current_version() + "\"}",
+        "JSON",
+        "  start mqtt_ha_bridge >/dev/null 2>&1",
+        "  exit 1",
+        "}",
+        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback start\" >> $LOG",
+        "cat > $STATUS <<'JSON'",
+        make_status_json("applying", "Rolling back to previous OTA backup", load_current_version()),
+        "JSON",
+        "stop mqtt_ha_bridge >/dev/null 2>&1",
+        "sleep 1",
+    ]
+    for install_to in sorted(OTA_ALLOWED_TARGETS.keys()):
+        lines.extend([
+            "if [ -f {} ]; then".format(shell_quote(install_to + ".bak")),
+            "  cp {} {} || fail {}".format(shell_quote(install_to + ".bak"), shell_quote(install_to), shell_quote("restore " + install_to)),
+            "  chmod 755 {} || fail {}".format(shell_quote(install_to), shell_quote("chmod " + install_to)),
+            "fi",
+        ])
+    lines.extend([
+        "start mqtt_ha_bridge >/dev/null 2>&1",
+        "cat > $STATUS <<'JSON'",
+        make_status_json("rolled_back", "Manual rollback applied; services restarted", load_current_version()),
+        "JSON",
+        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
+        "stop cubej_config_server >/dev/null 2>&1",
+        "sleep 1",
+        "start cubej_config_server >/dev/null 2>&1",
+    ])
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(OTA_APPLY_SCRIPT, 0o755)
@@ -402,6 +497,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(load_ota_status(), indent=2) + "\n",
                        "application/json; charset=utf-8")
             return
+        if self.path == "/config.json":
+            if not self._require_auth():
+                return
+            self._send(200, json.dumps(load_config(), indent=2) + "\n",
+                       "application/json; charset=utf-8")
+            return
         if self.path not in ("/", "/index.html"):
             self._send(404, "Not found\n", "text/plain; charset=utf-8")
             return
@@ -414,6 +515,17 @@ class ConfigHandler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             self._handle_ota_upload()
+            return
+        if self.path == "/ota/rollback":
+            if not self._require_auth():
+                return
+            start_ota_rollback()
+            self._send(200, self._render_form(message="OTA rollback accepted. Services will restart."))
+            return
+        if self.path == "/config/import":
+            if not self._require_auth():
+                return
+            self._handle_config_import()
             return
 
         if self.path != "/save":
@@ -431,22 +543,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
         errors = []
         for key, _, _ in FIELDS:
-            value = params.get(key, [""])[0]
-            if key in INT_FIELDS:
-                try:
-                    value = int(value)
-                except Exception:
-                    errors.append("{} must be a number".format(key))
-            cfg[key] = value
+            cfg[key] = params.get(key, [""])[0]
 
-        if cfg.get("web_port", 0) < 1 or cfg.get("web_port", 0) > 65535:
-            errors.append("web_port must be between 1 and 65535")
-        if cfg.get("mqtt_port", 0) < 1 or cfg.get("mqtt_port", 0) > 65535:
-            errors.append("mqtt_port must be between 1 and 65535")
-        if cfg.get("poll_interval", 0) < 1:
-            errors.append("poll_interval must be greater than 0")
-        if not str(cfg.get("web_user", "")):
-            errors.append("web_user must not be empty")
+        errors.extend(validate_config_values(cfg))
 
         if errors:
             self._send(400, self._render_form(errors=errors, message="Save failed"))
@@ -461,6 +560,68 @@ class ConfigHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log("save failed: {}".format(e))
             self._send(500, self._render_form(errors=[str(e)], message="Save failed"))
+
+    def _handle_config_import(self):
+        try:
+            import cgi
+        except ImportError:
+            self._send(500, self._render_form(
+                errors=["This Python runtime does not provide cgi.FieldStorage"],
+                message="Config import failed"))
+            return
+
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self._send(400, self._render_form(
+                errors=["Config import must be multipart/form-data"],
+                message="Config import failed"))
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        if length < 1 or length > MAX_CONFIG_IMPORT_SIZE:
+            self._send(400, self._render_form(
+                errors=["Config import size must be between 1 byte and {} bytes".format(MAX_CONFIG_IMPORT_SIZE)],
+                message="Config import failed"))
+            return
+
+        try:
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={
+                    "REQUEST_METHOD": "POST",
+                    "CONTENT_TYPE": ctype,
+                    "CONTENT_LENGTH": str(length),
+                })
+            if "config" not in form.keys():
+                raise ValueError("No config file was uploaded")
+            item = form["config"]
+            if isinstance(item, list):
+                item = item[0]
+            raw = item.file.read(MAX_CONFIG_IMPORT_SIZE + 1)
+            if len(raw) > MAX_CONFIG_IMPORT_SIZE:
+                raise ValueError("Config file is too large")
+            if not isinstance(raw, str):
+                raw = raw.decode("utf-8")
+
+            loaded = json.loads(raw, object_pairs_hook=collections.OrderedDict)
+            cfg = collections.OrderedDict(DEFAULTS)
+            for key, val in loaded.items():
+                if key in DEFAULTS:
+                    cfg[key] = val
+
+            errors = validate_config_values(cfg)
+            if errors:
+                self._send(400, self._render_form(errors=errors, message="Config import failed"))
+                return
+
+            save_config(cfg)
+            self.server.config = cfg
+            restart_bridge()
+            self._send(200, self._render_form(message="Config imported"))
+        except Exception as e:
+            log("config import failed: {}".format(e))
+            self._send(400, self._render_form(errors=[str(e)], message="Config import failed"))
 
     def _handle_ota_upload(self):
         try:
@@ -538,6 +699,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
         cfg = load_config()
         status_html = self._render_status(load_status())
         ota_html = self._render_ota_panel(load_ota_status())
+        config_tools_html = self._render_config_tools()
         rows = []
         for key, label, input_type in FIELDS:
             value = html_escape(cfg.get(key, DEFAULTS.get(key, "")))
@@ -580,6 +742,7 @@ input[type=file] {{ border: 0; padding-left: 0; }}
 button {{ font-size: 16px; padding: 9px 18px; border: 1px solid #2f6fed; background: #2f6fed; color: #fff; }}
 .message {{ background: #e6f4ea; border: 1px solid #9ad0a6; padding: 10px; margin-bottom: 12px; }}
 .error {{ background: #fce8e6; border: 1px solid #f2a39b; padding: 10px; margin-bottom: 12px; }}
+pre {{ background: #202124; color: #f1f3f4; padding: 10px; overflow: auto; font-size: 12px; max-height: 260px; }}
 p {{ line-height: 1.5; }}
 @media (max-width: 620px) {{ label, .grid, .values {{ grid-template-columns: 1fr; gap: 4px; }} main {{ padding: 16px; }} }}
 </style>
@@ -599,11 +762,12 @@ p {{ line-height: 1.5; }}
 </div>
 </form>
 <p>Changing the web port takes effect after reboot or service restart.</p>
+{config_tools}
 </main>
 </body>
 </html>
 """.format(message=message_html, errors=error_html, status=status_html,
-           ota=ota_html, rows="\n".join(rows))
+           ota=ota_html, rows="\n".join(rows), config_tools=config_tools_html)
 
     def _status_value(self, status, key, default="-"):
         value = status.get(key, default)
@@ -614,10 +778,14 @@ p {{ line-height: 1.5; }}
     def _render_ota_panel(self, ota_status):
         current_version = load_current_version() or "-"
         state = ota_status.get("state", "idle")
-        state_class = "ok" if state == "success" else ("bad" if state == "failed" else "muted")
+        state_class = "ok" if state == "success" else ("bad" if state in ("failed", "rolled_back") else "muted")
         version = ota_status.get("version") or "-"
         message = ota_status.get("message") or "-"
         updated = ota_status.get("updated_at") or "-"
+        ota_log = load_ota_log()
+        log_html = '<p class="muted">No OTA log yet.</p>'
+        if ota_log:
+            log_html = "<pre>{}</pre>".format(html_escape(ota_log))
 
         return """<section class="panel">
 <h2>OTA Update</h2>
@@ -635,13 +803,32 @@ p {{ line-height: 1.5; }}
 <a href="/ota_status.json">ota_status.json</a>
 </div>
 </form>
+<form method="post" action="/ota/rollback">
+<div class="actions">
+<button type="submit">Rollback OTA</button>
+</div>
+</form>
+{log_html}
 </section>""".format(
             current_version=html_escape(current_version),
             version=html_escape(version),
             state_class=state_class,
             state=html_escape(state),
             updated=html_escape(updated),
-            message=html_escape(message))
+            message=html_escape(message),
+            log_html=log_html)
+
+    def _render_config_tools(self):
+        return """<section class="panel">
+<h2>Config Backup</h2>
+<p><a href="/config.json">Download config.json</a></p>
+<form method="post" action="/config/import" enctype="multipart/form-data">
+<label><span>Import config</span><input name="config" type="file" accept=".json"></label>
+<div class="actions">
+<button type="submit">Import Config</button>
+</div>
+</form>
+</section>"""
 
     def _bool_status(self, value):
         if value is True:

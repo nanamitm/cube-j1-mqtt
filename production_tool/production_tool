@@ -23,9 +23,11 @@ sleep 5
 cp $PT/config.json       /data/local/config.json
 cp $PT/mqtt_bridge.py    /data/local/mqtt_bridge.py
 cp $PT/config_server.py  /data/local/config_server.py
+cp $PT/VERSION           /data/local/cube-j1-mqtt.version
 chmod 600 /data/local/config.json
 chmod 755 /data/local/mqtt_bridge.py
 chmod 755 /data/local/config_server.py
+chmod 644 /data/local/cube-j1-mqtt.version
 
 # make root filesystem writable so we can update init RC files
 mount -o rw,remount /

@@ -25,6 +25,7 @@ import datetime
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
 STATUS_PATH = "/data/local/mqtt_status.json"
+OTA_STATUS_PATH = "/data/local/ota_status.json"
 
 LED_R = "/sys/class/leds/red/brightness"
 LED_G = "/sys/class/leds/green/brightness"
@@ -68,6 +69,13 @@ def log(msg):
 def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
+
+def load_ota_status():
+    try:
+        with open(OTA_STATUS_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"state": "unknown", "message": "OTA status is not available"}
 
 def validate_config(cfg):
     missing = []
@@ -918,6 +926,21 @@ def publish_measurements(mqtt, device_id, m):
         if key in m and m[key] is not None:
             mqtt.publish("{}/{}".format(base, key), str(m[key]))
 
+def publish_bridge_status(mqtt, device_id):
+    base = "cubej/{}".format(device_id)
+    bridge_payload = {
+        "updated_at": now_str(),
+        "configuration_required": _status.get("configuration_required", False),
+        "missing_config": _status.get("missing_config", []),
+        "mqtt_connected": _status.get("mqtt_connected"),
+        "wisun_connected": _status.get("wisun_connected"),
+        "last_error": _status.get("last_error", ""),
+        "last_measurement_at": _status.get("last_measurement_at"),
+    }
+    ota_payload = load_ota_status()
+    mqtt.publish("{}/bridge_status".format(base), bridge_payload, retain=True)
+    mqtt.publish("{}/ota_status".format(base), ota_payload, retain=True)
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -978,6 +1001,7 @@ def main():
             time.sleep(15)
 
     publish_ha_discovery(mqtt, device_id)
+    publish_bridge_status(mqtt, device_id)
 
     # Open serial port
     log("Opening serial {}".format(serial_port))
@@ -1012,6 +1036,7 @@ def main():
     coeff     = 1
     unit_kwh  = 1.0
     last_ping = time.time()
+    last_status_publish = 0
     try:
         poll_epcs = detect_poll_epcs(fd, ipv6, tid)
         tid = (tid + 1) & 0xFFFF
@@ -1057,12 +1082,21 @@ def main():
                 mqtt.ping()
                 last_ping = time.time()
 
+            if time.time() - last_status_publish > 60:
+                publish_bridge_status(mqtt, device_id)
+                last_status_publish = time.time()
+
             time.sleep(poll_interval)
 
         except Exception as e:
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
             write_status(wisun_connected=False,
                          last_error="Main loop error: {}".format(e))
+            try:
+                publish_bridge_status(mqtt, device_id)
+                last_status_publish = time.time()
+            except Exception as e_pub:
+                log("Status publish failed: {}".format(e_pub))
             time.sleep(30)
             try:
                 ipv6 = wisun_connect(fd, br_id, br_pwd)
