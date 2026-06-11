@@ -20,6 +20,7 @@ import fcntl
 import collections
 import re
 import threading
+import datetime
 
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
@@ -324,7 +325,10 @@ def wisun_connect(fd, br_id, br_pwd):
 # ECHONET Lite frame builder / parser
 # ---------------------------------------------------------------------------
 
-EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
+DEFAULT_EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
+EXTRA_EPCS = [0x80, 0x82, 0x88, 0x97, 0x98, 0xD0, 0xD7, 0xEA, 0xEB]
+PROPERTY_MAP_EPC = 0x9F
+MISSING_CUMULATIVE_ENERGY = 0xFFFFFFFE
 
 def build_el_get(tid, epcs):
     frame = bytearray()
@@ -361,12 +365,87 @@ def parse_el_response(data):
         pos += pdc
     return result
 
+def parse_property_map(edt):
+    if not edt:
+        return set()
+
+    count = edt[0]
+    prop_map = edt[1:]
+    result = set()
+    if count < 16:
+        for epc in prop_map:
+            result.add(epc)
+    else:
+        for i, b in enumerate(prop_map):
+            for bit in range(8):
+                if b & (1 << bit):
+                    result.add(((bit + 0x08) << 4) + i)
+    return result
+
+def format_epcs(epcs):
+    return ",".join(["0x{:02X}".format(epc) for epc in sorted(epcs)])
+
+def decode_datetime7(edt):
+    if len(edt) < 7:
+        return None
+    try:
+        year = struct.unpack(">H", bytes(edt[0:2]))[0]
+        return datetime.datetime(year, edt[2], edt[3], edt[4], edt[5], edt[6])
+    except Exception:
+        return None
+
+def format_datetime(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
+
 def decode_measurements(props):
     result = {}
+
+    # 80: operation status (0x30=on, 0x31=off)
+    if 0x80 in props and len(props[0x80]) >= 1:
+        status = props[0x80][0]
+        if status == 0x30:
+            result["operation_status"] = "on"
+        elif status == 0x31:
+            result["operation_status"] = "off"
+        else:
+            result["operation_status"] = "unknown"
+
+    # 82: standard version information
+    if 0x82 in props and len(props[0x82]) >= 4:
+        edt = props[0x82]
+        prefix = ""
+        if edt[0] > 0:
+            prefix += chr(edt[0])
+        if edt[1] > 0:
+            prefix += chr(edt[1])
+        result["standard_version"] = "{}{}.{}".format(prefix, chr(edt[2]), edt[3])
+
+    # 88: fault status (0x41=fault, 0x42=no fault)
+    if 0x88 in props and len(props[0x88]) >= 1:
+        fault = props[0x88][0]
+        if fault == 0x41:
+            result["fault_status"] = "fault"
+        elif fault == 0x42:
+            result["fault_status"] = "normal"
+        else:
+            result["fault_status"] = "unknown"
+
+    # 97: current time setting
+    if 0x97 in props and len(props[0x97]) >= 2:
+        result["meter_time"] = "{:02d}:{:02d}".format(props[0x97][0], props[0x97][1])
+
+    # 98: current date setting
+    if 0x98 in props and len(props[0x98]) >= 4:
+        year = struct.unpack(">H", bytes(props[0x98][0:2]))[0]
+        result["meter_date"] = "{:04d}-{:02d}-{:02d}".format(year, props[0x98][2], props[0x98][3])
 
     # D3: coefficient (4-byte unsigned)
     if 0xD3 in props and len(props[0xD3]) >= 4:
         result["coefficient"] = struct.unpack(">I", bytes(props[0xD3][:4]))[0]
+
+    # D7: number of effective digits for cumulative energy
+    if 0xD7 in props and len(props[0xD7]) >= 1:
+        result["effective_digits"] = int(binascii.hexlify(bytes(props[0xD7])), 16)
 
     # E1: unit exponent byte
     if 0xE1 in props and len(props[0xE1]) >= 1:
@@ -393,6 +472,24 @@ def decode_measurements(props):
         result["current_r_a"] = r / 10.0
         result["current_t_a"] = t / 10.0
 
+    # D0: one-minute measured cumulative energy
+    if 0xD0 in props and len(props[0xD0]) >= 15:
+        dt = decode_datetime7(props[0xD0][0:7])
+        result["one_minute_timestamp"] = format_datetime(dt)
+        result["one_minute_energy_forward_raw"] = struct.unpack(">I", bytes(props[0xD0][7:11]))[0]
+        result["one_minute_energy_reverse_raw"] = struct.unpack(">I", bytes(props[0xD0][11:15]))[0]
+
+    # EA/EB: cumulative energy measured at fixed time
+    if 0xEA in props and len(props[0xEA]) >= 11:
+        dt = decode_datetime7(props[0xEA][0:7])
+        result["fixed_time_forward_timestamp"] = format_datetime(dt)
+        result["fixed_time_energy_forward_raw"] = struct.unpack(">I", bytes(props[0xEA][7:11]))[0]
+
+    if 0xEB in props and len(props[0xEB]) >= 11:
+        dt = decode_datetime7(props[0xEB][0:7])
+        result["fixed_time_reverse_timestamp"] = format_datetime(dt)
+        result["fixed_time_energy_reverse_raw"] = struct.unpack(">I", bytes(props[0xEB][7:11]))[0]
+
     return result
 
 def apply_energy_scale(measurements, coeff, unit_kwh):
@@ -402,19 +499,48 @@ def apply_energy_scale(measurements, coeff, unit_kwh):
         measurements["energy_forward_kwh"] = measurements["energy_forward_raw"] * c * u
     if "energy_reverse_raw" in measurements:
         measurements["energy_reverse_kwh"] = measurements["energy_reverse_raw"] * c * u
+    if measurements.get("one_minute_energy_forward_raw") not in (None, MISSING_CUMULATIVE_ENERGY):
+        measurements["one_minute_energy_forward_kwh"] = measurements["one_minute_energy_forward_raw"] * c * u
+    if measurements.get("one_minute_energy_reverse_raw") not in (None, MISSING_CUMULATIVE_ENERGY):
+        measurements["one_minute_energy_reverse_kwh"] = measurements["one_minute_energy_reverse_raw"] * c * u
+    if measurements.get("fixed_time_energy_forward_raw") not in (None, MISSING_CUMULATIVE_ENERGY):
+        measurements["fixed_time_energy_forward_kwh"] = measurements["fixed_time_energy_forward_raw"] * c * u
+    if measurements.get("fixed_time_energy_reverse_raw") not in (None, MISSING_CUMULATIVE_ENERGY):
+        measurements["fixed_time_energy_reverse_kwh"] = measurements["fixed_time_energy_reverse_raw"] * c * u
     return measurements
 
 # ---------------------------------------------------------------------------
 # Send ECHONET Lite Get via SKSENDTO
 # ---------------------------------------------------------------------------
 
-def send_el_get(fd, ipv6, tid):
-    frame = build_el_get(tid, EPCS)
+def send_el_get(fd, ipv6, tid, epcs=None):
+    frame = build_el_get(tid, epcs or DEFAULT_EPCS)
     # SKSENDTO expects 4-hex-digit payload length and trailing CRLF after raw data.
     cmd = "SKSENDTO 1 {} 0E1A 1 0 {:04X} ".format(ipv6, len(frame))
     serial_write(fd, cmd)
     serial_write(fd, frame)
     serial_write(fd, b"\r\n")
+
+def detect_poll_epcs(fd, ipv6, tid):
+    send_el_get(fd, ipv6, tid, [PROPERTY_MAP_EPC])
+    data = read_erxudp(fd, timeout=15)
+    if not data:
+        log("Get property map timeout; polling default EPCs only")
+        return list(DEFAULT_EPCS)
+
+    props = parse_el_response(data)
+    if PROPERTY_MAP_EPC not in props:
+        log("Get property map unavailable; polling default EPCs only")
+        return list(DEFAULT_EPCS)
+
+    supported = parse_property_map(props[PROPERTY_MAP_EPC])
+    log("Gettable EPCs: {}".format(format_epcs(supported)))
+    poll_epcs = list(DEFAULT_EPCS)
+    for epc in EXTRA_EPCS:
+        if epc in supported and epc not in poll_epcs:
+            poll_epcs.append(epc)
+    log("Polling EPCs: {}".format(format_epcs(poll_epcs)))
+    return poll_epcs
 
 def read_erxudp(fd, timeout=15):
     """Wait for ERXUDP and return payload as bytearray, or None."""
@@ -629,11 +755,24 @@ class MQTTClient(object):
 # ---------------------------------------------------------------------------
 
 SENSOR_DEFS = [
-    ("power",          "Instantaneous Power",  "W",   "power",   "measurement"),
-    ("energy_forward", "Cumulative Energy Fwd", "kWh", "energy",  "total_increasing"),
-    ("energy_reverse", "Cumulative Energy Rev", "kWh", "energy",  "total_increasing"),
-    ("current_r",      "Current R Phase",       "A",   "current", "measurement"),
-    ("current_t",      "Current T Phase",       "A",   "current", "measurement"),
+    ("power",                         "Instantaneous Power",       "W",   "power",   "measurement"),
+    ("energy_forward",                "Cumulative Energy Fwd",     "kWh", "energy",  "total_increasing"),
+    ("energy_reverse",                "Cumulative Energy Rev",     "kWh", "energy",  "total_increasing"),
+    ("current_r",                     "Current R Phase",           "A",   "current", "measurement"),
+    ("current_t",                     "Current T Phase",           "A",   "current", "measurement"),
+    ("one_minute_energy_forward",     "One Minute Energy Fwd",     "kWh", "energy",  "total_increasing"),
+    ("one_minute_energy_reverse",     "One Minute Energy Rev",     "kWh", "energy",  "total_increasing"),
+    ("fixed_time_energy_forward",     "Fixed Time Energy Fwd",     "kWh", "energy",  "total_increasing"),
+    ("fixed_time_energy_reverse",     "Fixed Time Energy Rev",     "kWh", "energy",  "total_increasing"),
+    ("effective_digits",              "Cumulative Energy Digits",  None,  None,      None),
+    ("operation_status",              "Operation Status",          None,  None,      None),
+    ("fault_status",                  "Fault Status",              None,  None,      None),
+    ("standard_version",              "Standard Version",          None,  None,      None),
+    ("meter_date",                    "Meter Date",                None,  None,      None),
+    ("meter_time",                    "Meter Time",                None,  None,      None),
+    ("one_minute_timestamp",          "One Minute Timestamp",      None,  None,      None),
+    ("fixed_time_forward_timestamp",  "Fixed Time Fwd Timestamp",  None,  None,      None),
+    ("fixed_time_reverse_timestamp",  "Fixed Time Rev Timestamp",  None,  None,      None),
 ]
 
 def publish_ha_discovery(mqtt, device_id):
@@ -650,11 +789,14 @@ def publish_ha_discovery(mqtt, device_id):
             "name":               name,
             "unique_id":          "{}_{}".format(device_id, sid),
             "state_topic":        "{}/{}".format(base, sid),
-            "unit_of_measurement": unit,
-            "device_class":       dev_class,
-            "state_class":        state_class,
             "device":             device,
         }
+        if unit:
+            config["unit_of_measurement"] = unit
+        if dev_class:
+            config["device_class"] = dev_class
+        if state_class:
+            config["state_class"] = state_class
         mqtt.publish(topic, config, retain=True)
         log("HA discovery: {}".format(topic))
 
@@ -670,6 +812,21 @@ def publish_measurements(mqtt, device_id, m):
         mqtt.publish("{}/current_r".format(base), "{:.1f}".format(m["current_r_a"]))
     if "current_t_a" in m:
         mqtt.publish("{}/current_t".format(base), "{:.1f}".format(m["current_t_a"]))
+    if "one_minute_energy_forward_kwh" in m:
+        mqtt.publish("{}/one_minute_energy_forward".format(base), "{:.3f}".format(m["one_minute_energy_forward_kwh"]))
+    if "one_minute_energy_reverse_kwh" in m:
+        mqtt.publish("{}/one_minute_energy_reverse".format(base), "{:.3f}".format(m["one_minute_energy_reverse_kwh"]))
+    if "fixed_time_energy_forward_kwh" in m:
+        mqtt.publish("{}/fixed_time_energy_forward".format(base), "{:.3f}".format(m["fixed_time_energy_forward_kwh"]))
+    if "fixed_time_energy_reverse_kwh" in m:
+        mqtt.publish("{}/fixed_time_energy_reverse".format(base), "{:.3f}".format(m["fixed_time_energy_reverse_kwh"]))
+    if "effective_digits" in m:
+        mqtt.publish("{}/effective_digits".format(base), str(m["effective_digits"]))
+    for key in ("operation_status", "fault_status", "standard_version", "meter_date",
+                "meter_time", "one_minute_timestamp", "fixed_time_forward_timestamp",
+                "fixed_time_reverse_timestamp"):
+        if key in m and m[key] is not None:
+            mqtt.publish("{}/{}".format(base, key), str(m[key]))
 
 # ---------------------------------------------------------------------------
 # Main
@@ -735,13 +892,19 @@ def main():
     coeff     = 1
     unit_kwh  = 1.0
     last_ping = time.time()
+    try:
+        poll_epcs = detect_poll_epcs(fd, ipv6, tid)
+        tid = (tid + 1) & 0xFFFF
+    except Exception as e:
+        log("EPC detection failed: {} - polling default EPCs only".format(e))
+        poll_epcs = list(DEFAULT_EPCS)
 
     while True:
         try:
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
-                send_el_get(fd, ipv6, tid)
+                send_el_get(fd, ipv6, tid, poll_epcs)
                 tid = (tid + 1) & 0xFFFF
                 data = read_erxudp(fd, timeout=15)
                 if data:
@@ -755,7 +918,10 @@ def main():
                     log("Measurements: {}".format(
                         {k: v for k, v in m.items()
                          if k in ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
-                                   "current_r_a", "current_t_a")}))
+                                   "current_r_a", "current_t_a",
+                                   "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
+                                   "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
+                                   "operation_status", "fault_status")}))
                     publish_measurements(mqtt, device_id, m)
                 else:
                     log("No ERXUDP response (timeout)")
@@ -774,6 +940,11 @@ def main():
             try:
                 ipv6 = wisun_connect(fd, br_id, br_pwd)
                 log("Wi-SUN reconnected at {}".format(ipv6))
+                try:
+                    poll_epcs = detect_poll_epcs(fd, ipv6, tid)
+                    tid = (tid + 1) & 0xFFFF
+                except Exception as e3:
+                    log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))
 
