@@ -1,0 +1,52 @@
+name: Release OTA package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "OTA package version"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-ota:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=manual-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build OTA package
+        run: |
+          python3 scripts/make_ota_package.py \
+            --version "${{ steps.version.outputs.value }}" \
+            --output dist/cube-j1-mqtt-update.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cube-j1-mqtt-update
+          path: dist/cube-j1-mqtt-update.zip
+
+      - name: Upload release asset
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/cube-j1-mqtt-update.zip

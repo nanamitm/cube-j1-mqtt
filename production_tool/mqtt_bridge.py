@@ -69,6 +69,43 @@ def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
+def validate_config(cfg):
+    missing = []
+    br_id = cfg.get("br_id", "")
+    br_pwd = cfg.get("br_pwd", "")
+    mqtt_host = cfg.get("mqtt_host", "")
+
+    if not br_id or br_id == "00000000000000000000000000000000":
+        missing.append("br_id")
+    if not br_pwd or br_pwd == "0123456789AB":
+        missing.append("br_pwd")
+    if not mqtt_host or mqtt_host == "192.168.1.254":
+        missing.append("mqtt_host")
+    return missing
+
+def wait_for_config():
+    while True:
+        try:
+            cfg = load_config()
+            missing = validate_config(cfg)
+            if not missing:
+                return cfg
+            write_status(bridge_started_at=_status.get("bridge_started_at") or now_str(),
+                         configuration_required=True,
+                         missing_config=missing,
+                         mqtt_connected=False,
+                         wisun_connected=False,
+                         last_error="Configuration required: {}".format(", ".join(missing)))
+            log("Configuration required: {} - waiting for Web UI save".format(", ".join(missing)))
+        except Exception as e:
+            write_status(bridge_started_at=_status.get("bridge_started_at") or now_str(),
+                         configuration_required=True,
+                         mqtt_connected=False,
+                         wisun_connected=False,
+                         last_error="Config load failed: {}".format(e))
+            log("Config load failed: {} - retry in 10s".format(e))
+        time.sleep(10)
+
 def now_str():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -892,7 +929,13 @@ def main():
     except Exception:
         pass
 
-    cfg           = load_config()
+    write_status(bridge_started_at=now_str(),
+                 configuration_required=True,
+                 mqtt_connected=False,
+                 wisun_connected=False,
+                 last_error="Loading configuration")
+
+    cfg           = wait_for_config()
     br_id         = cfg["br_id"]
     br_pwd        = cfg["br_pwd"]
     ha_host       = cfg["mqtt_host"]
@@ -910,6 +953,8 @@ def main():
                  mqtt_port=ha_port,
                  serial_port=serial_port,
                  poll_interval=poll_interval,
+                 configuration_required=False,
+                 missing_config=[],
                  mqtt_connected=False,
                  wisun_connected=False,
                  meter_ipv6=None,
