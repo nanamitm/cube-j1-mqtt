@@ -29,6 +29,7 @@ except ImportError:
 
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH = "/data/local/config_server.log"
+STATUS_PATH = "/data/local/mqtt_status.json"
 
 DEFAULTS = collections.OrderedDict([
     ("br_id", "00000000000000000000000000000000"),
@@ -81,6 +82,17 @@ def load_config():
     except Exception as e:
         log("load_config failed: {}".format(e))
     return cfg
+
+
+def load_status():
+    try:
+        with open(STATUS_PATH) as f:
+            return json.load(f, object_pairs_hook=collections.OrderedDict)
+    except Exception as e:
+        return collections.OrderedDict([
+            ("status_unavailable", True),
+            ("message", "Status is not available yet: {}".format(e)),
+        ])
 
 
 def save_config(cfg):
@@ -155,6 +167,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        if self.path == "/status.json":
+            if not self._require_auth():
+                return
+            self._send(200, json.dumps(load_status(), indent=2) + "\n",
+                       "application/json; charset=utf-8")
+            return
         if self.path not in ("/", "/index.html"):
             self._send(404, "Not found\n", "text/plain; charset=utf-8")
             return
@@ -211,6 +229,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
     def _render_form(self, message=None, errors=None):
         cfg = load_config()
+        status_html = self._render_status(load_status())
         rows = []
         for key, label, input_type in FIELDS:
             value = html_escape(cfg.get(key, DEFAULTS.get(key, "")))
@@ -234,6 +253,16 @@ body {{ font-family: sans-serif; margin: 0; background: #f6f7f9; color: #202124;
 main {{ max-width: 760px; margin: 0 auto; padding: 24px; }}
 h1 {{ font-size: 24px; margin: 0 0 18px; }}
 form {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; }}
+.panel {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; margin-bottom: 18px; }}
+.panel h2 {{ font-size: 18px; margin: 0 0 12px; }}
+.grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }}
+.item span {{ display: block; color: #5f6368; font-size: 13px; margin-bottom: 3px; }}
+.item strong {{ font-size: 16px; overflow-wrap: anywhere; }}
+.ok {{ color: #137333; }}
+.bad {{ color: #a50e0e; }}
+.muted {{ color: #5f6368; }}
+.values {{ margin-top: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }}
+.code {{ font-family: monospace; font-size: 13px; overflow-wrap: anywhere; }}
 label {{ display: grid; grid-template-columns: 210px 1fr; gap: 12px; align-items: center; margin: 10px 0; }}
 input {{ font-size: 16px; padding: 8px; border: 1px solid #b9c0c8; }}
 .actions {{ display: flex; gap: 16px; align-items: center; margin-top: 18px; flex-wrap: wrap; }}
@@ -243,7 +272,7 @@ button {{ font-size: 16px; padding: 9px 18px; border: 1px solid #2f6fed; backgro
 .message {{ background: #e6f4ea; border: 1px solid #9ad0a6; padding: 10px; margin-bottom: 12px; }}
 .error {{ background: #fce8e6; border: 1px solid #f2a39b; padding: 10px; margin-bottom: 12px; }}
 p {{ line-height: 1.5; }}
-@media (max-width: 620px) {{ label {{ grid-template-columns: 1fr; gap: 4px; }} main {{ padding: 16px; }} }}
+@media (max-width: 620px) {{ label, .grid, .values {{ grid-template-columns: 1fr; gap: 4px; }} main {{ padding: 16px; }} }}
 </style>
 </head>
 <body>
@@ -251,6 +280,7 @@ p {{ line-height: 1.5; }}
 <h1>Cube J1 MQTT Config</h1>
 {message}
 {errors}
+{status}
 <form method="post" action="/save">
 {rows}
 <div class="actions">
@@ -262,7 +292,69 @@ p {{ line-height: 1.5; }}
 </main>
 </body>
 </html>
-""".format(message=message_html, errors=error_html, rows="\n".join(rows))
+""".format(message=message_html, errors=error_html, status=status_html, rows="\n".join(rows))
+
+    def _status_value(self, status, key, default="-"):
+        value = status.get(key, default)
+        if value in (None, ""):
+            return default
+        return html_escape(value)
+
+    def _bool_status(self, value):
+        if value is True:
+            return '<strong class="ok">connected</strong>'
+        if value is False:
+            return '<strong class="bad">disconnected</strong>'
+        return '<strong class="muted">unknown</strong>'
+
+    def _render_status(self, status):
+        values = status.get("last_values") or {}
+        value_rows = []
+        for key in sorted(values.keys()):
+            value_rows.append('<div class="item"><span>{}</span><strong>{}</strong></div>'.format(
+                html_escape(key), html_escape(values[key])))
+        if not value_rows:
+            value_rows.append('<div class="item"><span>values</span><strong class="muted">none yet</strong></div>')
+
+        gettable = ", ".join(status.get("gettable_epcs") or [])
+        polling = ", ".join(status.get("polling_epcs") or [])
+        if not gettable:
+            gettable = "-"
+        if not polling:
+            polling = "-"
+
+        last_error = status.get("last_error") or "-"
+        error_class = "bad" if last_error != "-" else "muted"
+
+        return """<section class="panel">
+<h2>Status</h2>
+<div class="grid">
+<div class="item"><span>MQTT</span>{mqtt}</div>
+<div class="item"><span>Wi-SUN</span>{wisun}</div>
+<div class="item"><span>Device ID</span><strong>{device_id}</strong></div>
+<div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
+<div class="item"><span>Bridge started</span><strong>{started}</strong></div>
+<div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
+<div class="item"><span>Updated</span><strong>{updated}</strong></div>
+<div class="item"><span>Last error</span><strong class="{error_class}">{last_error}</strong></div>
+</div>
+<div class="values">{values}</div>
+<p class="code">Polling EPCs: {polling}</p>
+<p class="code">Gettable EPCs: {gettable}</p>
+<p><a href="/status.json">status.json</a></p>
+</section>""".format(
+            mqtt=self._bool_status(status.get("mqtt_connected")),
+            wisun=self._bool_status(status.get("wisun_connected")),
+            device_id=self._status_value(status, "device_id"),
+            meter_ipv6=self._status_value(status, "meter_ipv6"),
+            started=self._status_value(status, "bridge_started_at"),
+            last_measurement=self._status_value(status, "last_measurement_at"),
+            updated=self._status_value(status, "updated_at"),
+            error_class=error_class,
+            last_error=html_escape(last_error),
+            values="\n".join(value_rows),
+            polling=html_escape(polling),
+            gettable=html_escape(gettable))
 
 
 def main():

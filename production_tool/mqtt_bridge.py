@@ -24,6 +24,7 @@ import datetime
 
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
+STATUS_PATH = "/data/local/mqtt_status.json"
 
 LED_R = "/sys/class/leds/red/brightness"
 LED_G = "/sys/class/leds/green/brightness"
@@ -48,6 +49,7 @@ def led_read():
     return tuple(result)
 
 _log_file = None
+_status = {}
 
 def log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -66,6 +68,41 @@ def log(msg):
 def load_config():
     with open(CONFIG_PATH) as f:
         return json.load(f)
+
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def write_status(**kwargs):
+    global _status
+    _status.update(kwargs)
+    _status["updated_at"] = now_str()
+    tmp_path = STATUS_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(_status, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.rename(tmp_path, STATUS_PATH)
+    except Exception as e:
+        log("status write failed: {}".format(e))
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+def epcs_to_hex(epcs):
+    return ["0x{:02X}".format(epc) for epc in epcs]
+
+def measurement_summary(m):
+    keys = ("power_w", "energy_forward_kwh", "energy_reverse_kwh",
+            "current_r_a", "current_t_a",
+            "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
+            "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
+            "operation_status", "fault_status", "meter_date", "meter_time")
+    result = {}
+    for key in keys:
+        if key in m:
+            result[key] = m[key]
+    return result
 
 # ---------------------------------------------------------------------------
 # Serial port (termios, no pyserial)
@@ -526,11 +563,17 @@ def detect_poll_epcs(fd, ipv6, tid):
     data = read_erxudp(fd, timeout=15)
     if not data:
         log("Get property map timeout; polling default EPCs only")
+        write_status(gettable_epcs=[],
+                     polling_epcs=epcs_to_hex(DEFAULT_EPCS),
+                     last_error="Get property map timeout")
         return list(DEFAULT_EPCS)
 
     props = parse_el_response(data)
     if PROPERTY_MAP_EPC not in props:
         log("Get property map unavailable; polling default EPCs only")
+        write_status(gettable_epcs=[],
+                     polling_epcs=epcs_to_hex(DEFAULT_EPCS),
+                     last_error="Get property map unavailable")
         return list(DEFAULT_EPCS)
 
     supported = parse_property_map(props[PROPERTY_MAP_EPC])
@@ -540,6 +583,9 @@ def detect_poll_epcs(fd, ipv6, tid):
         if epc in supported and epc not in poll_epcs:
             poll_epcs.append(epc)
     log("Polling EPCs: {}".format(format_epcs(poll_epcs)))
+    write_status(gettable_epcs=epcs_to_hex(sorted(supported)),
+                 polling_epcs=epcs_to_hex(poll_epcs),
+                 last_error="")
     return poll_epcs
 
 def read_erxudp(fd, timeout=15):
@@ -645,6 +691,10 @@ class MQTTClient(object):
 
         self.sock = s
         log("MQTT connected to {}:{}".format(self.host, self.port))
+        write_status(mqtt_connected=True,
+                     mqtt_host=self.host,
+                     mqtt_port=self.port,
+                     last_error="")
 
         # flush any queued messages
         try:
@@ -671,6 +721,8 @@ class MQTTClient(object):
             return
         except Exception as e:
             log("MQTT publish error: {}".format(e))
+            write_status(mqtt_connected=False,
+                         last_error="MQTT publish error: {}".format(e))
             # try reconnect and resend
             try:
                 self._reconnect()
@@ -736,6 +788,7 @@ class MQTTClient(object):
 
     def _reconnect(self):
         log("MQTT reconnecting …")
+        write_status(mqtt_connected=False)
         try:
             if self.sock:
                 self.sock.close()
@@ -851,6 +904,20 @@ def main():
     poll_interval = int(cfg.get("poll_interval", 60))
 
     log("=== mqtt_bridge start device_id={} ===".format(device_id))
+    write_status(bridge_started_at=now_str(),
+                 device_id=device_id,
+                 mqtt_host=ha_host,
+                 mqtt_port=ha_port,
+                 serial_port=serial_port,
+                 poll_interval=poll_interval,
+                 mqtt_connected=False,
+                 wisun_connected=False,
+                 meter_ipv6=None,
+                 gettable_epcs=[],
+                 polling_epcs=epcs_to_hex(DEFAULT_EPCS),
+                 last_measurement_at=None,
+                 last_values={},
+                 last_error="")
 
     # Connect MQTT
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
@@ -861,6 +928,8 @@ def main():
             break
         except Exception as e:
             log("MQTT connect failed: {} - retry in 15s".format(e))
+            write_status(mqtt_connected=False,
+                         last_error="MQTT connect failed: {}".format(e))
             time.sleep(15)
 
     publish_ha_discovery(mqtt, device_id)
@@ -874,6 +943,7 @@ def main():
             break
         except Exception as e:
             log("Serial open failed: {} - retry in 10s".format(e))
+            write_status(last_error="Serial open failed: {}".format(e))
             time.sleep(10)
 
     # Wi-SUN join
@@ -884,9 +954,14 @@ def main():
             break
         except Exception as e:
             log("Wi-SUN join failed: {} - retry in 60s".format(e))
+            write_status(wisun_connected=False,
+                         last_error="Wi-SUN join failed: {}".format(e))
             time.sleep(60)
 
     log("Meter connected at {}".format(ipv6))
+    write_status(wisun_connected=True,
+                 meter_ipv6=ipv6,
+                 last_error="")
 
     tid       = 1
     coeff     = 1
@@ -922,9 +997,14 @@ def main():
                                    "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
                                    "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
                                    "operation_status", "fault_status")}))
+                    write_status(last_measurement_at=now_str(),
+                                 last_values=measurement_summary(m),
+                                 wisun_connected=True,
+                                 last_error="")
                     publish_measurements(mqtt, device_id, m)
                 else:
                     log("No ERXUDP response (timeout)")
+                    write_status(last_error="No ERXUDP response (timeout)")
             finally:
                 led_rgb(*orig_led)
 
@@ -936,17 +1016,25 @@ def main():
 
         except Exception as e:
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
+            write_status(wisun_connected=False,
+                         last_error="Main loop error: {}".format(e))
             time.sleep(30)
             try:
                 ipv6 = wisun_connect(fd, br_id, br_pwd)
                 log("Wi-SUN reconnected at {}".format(ipv6))
+                write_status(wisun_connected=True,
+                             meter_ipv6=ipv6,
+                             last_error="")
                 try:
                     poll_epcs = detect_poll_epcs(fd, ipv6, tid)
                     tid = (tid + 1) & 0xFFFF
                 except Exception as e3:
                     log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
+                    write_status(last_error="EPC detection after reconnect failed: {}".format(e3))
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))
+                write_status(wisun_connected=False,
+                             last_error="Wi-SUN reconnect failed: {}".format(e2))
 
 
 if __name__ == "__main__":
