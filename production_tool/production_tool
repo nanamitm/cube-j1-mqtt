@@ -20,9 +20,12 @@ sleep 5
 # ── Install MQTT bridge (persistent, survives USB removal) ────────────────────
 
 # copy config and bridge script to /data/local (always writable)
-cp $PT/config.json    /data/local/config.json
-cp $PT/mqtt_bridge.py /data/local/mqtt_bridge.py
+cp $PT/config.json       /data/local/config.json
+cp $PT/mqtt_bridge.py    /data/local/mqtt_bridge.py
+cp $PT/config_server.py  /data/local/config_server.py
+chmod 600 /data/local/config.json
 chmod 755 /data/local/mqtt_bridge.py
+chmod 755 /data/local/config_server.py
 
 # make root filesystem writable so we can update init RC files
 mount -o rw,remount /
@@ -36,6 +39,9 @@ cp $PT/ndeclite_disabled.rc /system/etc/init/ndeclite_agent.rc
 # install our MQTT bridge as an init service (auto-start on next boot)
 cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
 
+# install config web UI as an init service
+cp $PT/config_server.rc /system/etc/init/cubej_config_server.rc
+
 # ── Stop conflicting services immediately ──────────────────────────────────────
 stop wisund
 stop NDEcLiteAgent
@@ -43,8 +49,10 @@ sleep 2
 
 # ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───
 stop mqtt_ha_bridge 2>/dev/null || true
+stop cubej_config_server 2>/dev/null || true
 sleep 1
 start mqtt_ha_bridge
+start cubej_config_server
 
 # ── Finish LED (blink white) ───────────────────────────────────────────────
 cp $PT/led_effect.sh /data/local/led_effect.sh
