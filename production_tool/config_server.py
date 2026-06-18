@@ -43,8 +43,9 @@ OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
 AVAHI_CONF_PATH = "/system/etc/avahi-daemon.conf"
-AVAHI_SERVICE_DIR = "/system/etc/avahi/services"
-AVAHI_SERVICE_PATH = "/system/etc/avahi/services/cube-j1-mqtt.service"
+AVAHI_DATA_DIR = "/data/misc/avahi"
+AVAHI_SERVICE_DIR = "/data/misc/avahi/services"
+AVAHI_SERVICE_PATH = "/data/misc/avahi/services/cube-j1-mqtt.service"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
@@ -549,9 +550,12 @@ def sync_avahi_service(cfg):
         pass
 
     try:
-        os.system("mount -o rw,remount / >/dev/null 2>&1")
+        if not os.path.isdir(AVAHI_DATA_DIR):
+            os.makedirs(AVAHI_DATA_DIR)
+            os.chmod(AVAHI_DATA_DIR, 0o755)
         if not os.path.isdir(AVAHI_SERVICE_DIR):
             os.makedirs(AVAHI_SERVICE_DIR)
+            os.chmod(AVAHI_SERVICE_DIR, 0o755)
         with open(AVAHI_SERVICE_PATH, "w") as f:
             f.write(service_xml)
         os.chmod(AVAHI_SERVICE_PATH, 0o644)
