@@ -633,6 +633,55 @@ def send_el_get(fd, ipv6, tid, epcs=None):
     serial_write(fd, frame)
     serial_write(fd, b"\r\n")
 
+# Per-property response size estimate (EPC + PDC bytes), used to keep each
+# batched Get request within what this meter answers in a single frame.
+# Observed in the field: a Get with all polling EPCs in one frame comes
+# back as Get_SNA with a silently truncated OPC list (only the first ~6
+# properties), instead of an error for the dropped ones - so requests must
+# be split into smaller batches rather than sent as one combined Get.
+EPC_RESPONSE_BYTES = {
+    0x80: 1, 0x82: 4, 0x88: 1, 0x97: 2, 0x98: 4,
+    0xD0: 15, 0xD3: 4, 0xD7: 1, 0xE0: 4, 0xE1: 1, 0xE2: 4,
+    0xE3: 4, 0xE4: 4, 0xE5: 4, 0xE7: 4, 0xE8: 4, 0xEA: 11, 0xEB: 11,
+}
+MAX_BATCH_RESPONSE_BYTES = 33
+
+def batch_epcs(epcs):
+    """Split epcs into request batches sized to fit one Get response frame."""
+    batches = []
+    current = []
+    current_size = 0
+    for epc in epcs:
+        size = 2 + EPC_RESPONSE_BYTES.get(epc, 4)
+        if current and current_size + size > MAX_BATCH_RESPONSE_BYTES:
+            batches.append(current)
+            current = []
+            current_size = 0
+        current.append(epc)
+        current_size += size
+    if current:
+        batches.append(current)
+    return batches
+
+def read_measurements(fd, ipv6, tid, epcs):
+    """Get a list of EPCs, merging results across one or more Get requests.
+
+    Returns (props, tid). epcs is split into size-limited batches by
+    batch_epcs() since a single combined Get can lose properties beyond
+    what the meter answers in one frame.
+    """
+    props = {}
+    for batch in batch_epcs(epcs):
+        send_el_get(fd, ipv6, tid, batch)
+        request_tid = tid
+        tid = (tid + 1) & 0xFFFF
+        data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
+        if data:
+            props.update(parse_el_response(data))
+        else:
+            log("No ERXUDP response (timeout) for batch {}".format(format_epcs(batch)))
+    return props, tid
+
 def detect_poll_epcs(fd, ipv6, tid):
     """Get the property map and derive poll_epcs; returns (poll_epcs, tid).
 
@@ -1114,12 +1163,8 @@ def main():
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
-                send_el_get(fd, ipv6, tid, poll_epcs)
-                request_tid = tid
-                tid = (tid + 1) & 0xFFFF
-                data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
-                if data:
-                    props = parse_el_response(data)
+                props, tid = read_measurements(fd, ipv6, tid, poll_epcs)
+                if props:
                     m     = decode_measurements(props)
                     m     = apply_energy_scale(m, coeff, unit_kwh)
                     if "coefficient" in m:
