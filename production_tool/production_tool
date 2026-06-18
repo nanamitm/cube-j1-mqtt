@@ -14,8 +14,22 @@ start adbd
 cp $PT/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf
 chmod 660 /data/misc/wifi/wpa_supplicant.conf
 chown system:wifi /data/misc/wifi/wpa_supplicant.conf
+
+# install LED helper early so it can show Wi-Fi connection progress below
+cp $PT/led_effect.sh /data/local/led_effect.sh
+chmod 755 /data/local/led_effect.sh
+
 wpa_cli -p /data/misc/wifi/sockets -i wlan0 reconfigure
-sleep 5
+
+# ── Blink blue until Wi-Fi association completes (give up after ~5 min) ───────
+i=0
+while [ $i -lt 500 ]; do
+    if wpa_cli -p /data/misc/wifi/sockets -i wlan0 status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
+        break
+    fi
+    /data/local/led_effect.sh blink blue 1
+    i=$((i + 1))
+done
 
 # ── Install MQTT bridge (persistent, survives USB removal) ────────────────────
 
@@ -42,7 +56,7 @@ cp $PT/ndeclite_disabled.rc /system/etc/init/ndeclite_agent.rc
 cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
 
 # install config web UI as an init service
-cp $PT/config_server.rc /system/etc/init/cubej_config_server.rc
+cp $PT/config_server.rc /system/etc/init/cubej_web_ui.rc
 
 # ── Stop conflicting services immediately ──────────────────────────────────────
 stop wisund
@@ -51,12 +65,10 @@ sleep 2
 
 # ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───
 stop mqtt_ha_bridge 2>/dev/null || true
-stop cubej_config_server 2>/dev/null || true
+stop cubej_web_ui 2>/dev/null || true
 sleep 1
 start mqtt_ha_bridge
-start cubej_config_server
+start cubej_web_ui
 
 # ── Finish LED (blink white) ───────────────────────────────────────────────
-cp $PT/led_effect.sh /data/local/led_effect.sh
-chmod 755 /data/local/led_effect.sh
 /data/local/led_effect.sh blink white 10

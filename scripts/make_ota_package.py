@@ -59,7 +59,7 @@ def build_manifest(root, version):
         "files": files,
         "restart": [
             "mqtt_ha_bridge",
-            "cubej_config_server",
+            "cubej_web_ui",
         ],
     }
 

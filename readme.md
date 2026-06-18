@@ -146,6 +146,7 @@ Cube J1 の RGB LED は、動作状態に応じて以下のように発光・点
 
 | 状態 | LED の動き |
 |---|---|
+| Wi-Fi 接続待ち（セットアップ時） | 青色で点滅（最大 5 分間） |
 | セットアップ完了時 | 白色で点滅（10回） |
 | Wi-SUN コマンド送信中（SKSTACK） | 緑色と青色が交互に点滅（0.2 秒間隔） |
 | PANA 接続待機中（SKJOIN） | 緑色と青色が交互に点滅（0.2 秒間隔） |
@@ -160,11 +161,11 @@ Cube J1 の RGB LED は、動作状態に応じて以下のように発光・点
 USB メモリ挿入時に Cube J1 が自動実行するメインスクリプト（`production_tool`）は、以下の処理を順に行っています。
 
 1. **ADB の TCP 有効化**: ポート `5555` で ADB 接続を受け付けるように設定
-2. **Wi-Fi 設定**: `wpa_supplicant.conf` をシステムに配置してネットワークを再起動
+2. **Wi-Fi 設定**: `wpa_supplicant.conf` をシステムに配置してネットワークを再起動し、Wi-Fi 接続が完了するまで LED を青色で点滅させて待機（最大 5 分、タイムアウト後も処理は続行）
 3. **ブリッジプログラムと設定 Web UI の配置**: `config.json`、`mqtt_bridge.py`、`config_server.py` を `/data/local/` ディレクトリへコピー
 4. **競合サービスの停止**: Wi-SUN モジュール（`/dev/ttyS1`）を占有してしまう既存サービス（`wisund`、`NDEcLiteAgent`）を停止し、以後の起動を無効化
 5. **init サービスの登録**: 再起動後もプログラムが自動起動するよう、`mqtt_ha_bridge.rc` と `config_server.rc` を `/system/etc/init/` へ配置
-6. **ブリッジと設定 Web UI の即時起動**: `mqtt_ha_bridge` サービスとして `mqtt_bridge.py`、`cubej_config_server` サービスとして `config_server.py` を起動開始
+6. **ブリッジと設定 Web UI の即時起動**: `mqtt_ha_bridge` サービスとして `mqtt_bridge.py`、`cubej_web_ui` サービスとして `config_server.py` を起動開始
 7. **完了通知**: `led_effect.sh` を呼び出し、LED を点滅させてセットアップ完了を通知
 
 ### ファイル構成
@@ -249,8 +250,8 @@ adb shell cat /data/local/config_server.log
 adb shell ps | grep python
 
 # 設定用 Web UI を再起動
-adb shell stop cubej_config_server
-adb shell start cubej_config_server
+adb shell stop cubej_web_ui
+adb shell start cubej_web_ui
 
 # MQTT ブリッジを再起動
 adb shell stop mqtt_ha_bridge

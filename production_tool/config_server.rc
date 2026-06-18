@@ -1,4 +1,4 @@
-service cubej_config_server /usr/bin/python /data/local/config_server.py
+service cubej_web_ui /usr/bin/python /data/local/config_server.py
     class late_start
     user root
     group root

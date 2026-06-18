@@ -138,6 +138,8 @@ def validate_config_values(cfg):
 
     if cfg.get("web_port", 0) < 1 or cfg.get("web_port", 0) > 65535:
         errors.append("web_port must be between 1 and 65535")
+    elif cfg.get("web_port", 0) == 80:
+        errors.append("web_port 80 is already used by the device's built-in nginx; choose another port")
     if cfg.get("mqtt_port", 0) < 1 or cfg.get("mqtt_port", 0) > 65535:
         errors.append("mqtt_port must be between 1 and 65535")
     if cfg.get("poll_interval", 0) < 1:
@@ -375,9 +377,9 @@ def start_ota_apply(manifest):
     lines.extend(shell_status_heredoc("success", "OTA update applied; services restarted", version))
     lines.extend([
         "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] apply success version={}\" >> $LOG".format(version),
-        "stop cubej_config_server >/dev/null 2>&1",
+        "stop cubej_web_ui >/dev/null 2>&1",
         "sleep 1",
-        "start cubej_config_server >/dev/null 2>&1",
+        "start cubej_web_ui >/dev/null 2>&1",
     ])
 
     with open(OTA_APPLY_SCRIPT, "w") as f:
@@ -420,9 +422,9 @@ def start_ota_rollback():
         make_status_json("rolled_back", "Manual rollback applied; services restarted", load_current_version()),
         "JSON",
         "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
-        "stop cubej_config_server >/dev/null 2>&1",
+        "stop cubej_web_ui >/dev/null 2>&1",
         "sleep 1",
-        "start cubej_config_server >/dev/null 2>&1",
+        "start cubej_web_ui >/dev/null 2>&1",
     ])
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -437,6 +439,11 @@ def html_escape(s):
 def restart_bridge():
     rc = os.system("stop mqtt_ha_bridge >/dev/null 2>&1; sleep 1; start mqtt_ha_bridge >/dev/null 2>&1")
     log("restart_bridge rc={}".format(rc))
+
+
+def reboot_device():
+    rc = os.system("(sleep 1; reboot) >/dev/null 2>&1 &")
+    log("reboot_device rc={}".format(rc))
 
 
 class ConfigHandler(BaseHTTPRequestHandler):
@@ -526,6 +533,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             self._handle_config_import()
+            return
+        if self.path == "/reboot":
+            if not self._require_auth():
+                return
+            reboot_device()
+            self._send(200, self._render_form(message="Reboot requested. The device will restart in a few seconds."))
             return
 
         if self.path != "/save":
@@ -761,7 +774,12 @@ p {{ line-height: 1.5; }}
 <label><input type="checkbox" name="restart_bridge" value="1" checked> Restart MQTT bridge</label>
 </div>
 </form>
-<p>Changing the web port takes effect after reboot or service restart.</p>
+<p>Changing the web port takes effect after reboot or service restart. Port 80 is reserved by the device's built-in nginx and cannot be used.</p>
+<form method="post" action="/reboot" onsubmit="return confirm('Reboot the device now?');">
+<div class="actions">
+<button type="submit">Reboot Device</button>
+</div>
+</form>
 {config_tools}
 </main>
 </body>
