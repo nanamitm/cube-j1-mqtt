@@ -39,6 +39,7 @@ OTA_STAGING_DIR = "/data/local/ota_staging"
 OTA_APPLY_SCRIPT = "/data/local/apply_ota_update.sh"
 OTA_VERSION_PATH = "/data/local/cube-j1-mqtt.version"
 OTA_LOG_PATH = "/data/local/ota_apply.log"
+BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
@@ -223,10 +224,10 @@ def get_wifi_ssid():
     return ""
 
 
-def load_ota_log(max_bytes=8192):
+def tail_log_file(path, max_bytes=8192):
     try:
-        size = os.path.getsize(OTA_LOG_PATH)
-        with open(OTA_LOG_PATH, "rb") as f:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
             if size > max_bytes:
                 f.seek(size - max_bytes)
             data = f.read()
@@ -235,6 +236,14 @@ def load_ota_log(max_bytes=8192):
         return data
     except Exception:
         return ""
+
+
+def load_ota_log(max_bytes=8192):
+    return tail_log_file(OTA_LOG_PATH, max_bytes)
+
+
+def load_bridge_log(max_bytes=8192):
+    return tail_log_file(BRIDGE_LOG_PATH, max_bytes)
 
 
 def is_safe_zip_name(name):
@@ -544,6 +553,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(load_config(), indent=2) + "\n",
                        "application/json; charset=utf-8")
             return
+        if self.path == "/mqtt_bridge.log":
+            if not self._require_auth():
+                return
+            self._send(200, tail_log_file(BRIDGE_LOG_PATH, 262144) or "No log yet\n",
+                       "text/plain; charset=utf-8")
+            return
         if self.path not in ("/", "/index.html"):
             self._send(404, "Not found\n", "text/plain; charset=utf-8")
             return
@@ -775,6 +790,7 @@ h1 {{ font-size: 24px; margin: 0 0 18px; }}
 form {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; }}
 .panel {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; margin-bottom: 18px; }}
 .panel h2 {{ font-size: 18px; margin: 0 0 12px; }}
+.panel h3 {{ font-size: 14px; margin: 16px 0 8px; color: #5f6368; }}
 .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }}
 .item span {{ display: block; color: #5f6368; font-size: 13px; margin-bottom: 3px; }}
 .item strong {{ font-size: 16px; overflow-wrap: anywhere; }}
@@ -920,6 +936,11 @@ p {{ line-height: 1.5; }}
 
         wifi_ssid = get_wifi_ssid() or "-"
 
+        bridge_log = load_bridge_log()
+        bridge_log_html = '<p class="muted">No bridge log yet.</p>'
+        if bridge_log:
+            bridge_log_html = "<pre>{}</pre>".format(html_escape(bridge_log))
+
         return """<section class="panel">
 <h2>Status</h2>
 <div class="grid">
@@ -939,6 +960,9 @@ p {{ line-height: 1.5; }}
 <p class="code">Polling EPCs: {polling}</p>
 <p class="code">Gettable EPCs: {gettable}</p>
 <p><a href="/status.json">status.json</a></p>
+<h3>Bridge Log (last 8KB)</h3>
+{bridge_log_html}
+<p><a href="/mqtt_bridge.log">mqtt_bridge.log (full)</a></p>
 </section>""".format(
             wifi_ssid=html_escape(wifi_ssid),
             mqtt=self._bool_status(status.get("mqtt_connected")),
@@ -955,7 +979,8 @@ p {{ line-height: 1.5; }}
             last_error=html_escape(last_error),
             values="\n".join(value_rows),
             polling=html_escape(polling),
-            gettable=html_escape(gettable))
+            gettable=html_escape(gettable),
+            bridge_log_html=bridge_log_html)
 
 
 def main():
