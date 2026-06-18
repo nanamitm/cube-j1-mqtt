@@ -12,6 +12,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -41,6 +42,7 @@ OTA_VERSION_PATH = "/data/local/cube-j1-mqtt.version"
 OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
+AVAHI_CONF_PATH = "/system/etc/avahi-daemon.conf"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
@@ -498,6 +500,48 @@ def reboot_device():
     log("reboot_device rc={}".format(rc))
 
 
+def sanitize_hostname(value):
+    name = re.sub(r"[^A-Za-z0-9-]", "-", str(value or "")).strip("-")
+    return name.lower() or "cubej1"
+
+
+def sync_avahi_hostname(device_id):
+    hostname = sanitize_hostname(device_id)
+    try:
+        with open(AVAHI_CONF_PATH) as f:
+            lines = f.readlines()
+    except Exception as e:
+        log("avahi config read failed: {}".format(e))
+        return
+
+    new_line = "host-name={}\n".format(hostname)
+    found = False
+    changed = False
+    for i, line in enumerate(lines):
+        if re.match(r"^#?\s*host-name\s*=", line):
+            found = True
+            if line != new_line:
+                lines[i] = new_line
+                changed = True
+            break
+    if not found:
+        lines.insert(0, new_line)
+        changed = True
+
+    if not changed:
+        return
+
+    try:
+        os.system("mount -o rw,remount / >/dev/null 2>&1")
+        with open(AVAHI_CONF_PATH, "w") as f:
+            f.writelines(lines)
+        os.chmod(AVAHI_CONF_PATH, 0o644)
+        rc = os.system("stop avahi-daemon >/dev/null 2>&1; sleep 1; start avahi-daemon >/dev/null 2>&1")
+        log("avahi host-name set to {} rc={}".format(hostname, rc))
+    except Exception as e:
+        log("avahi config update failed: {}".format(e))
+
+
 class ConfigHandler(BaseHTTPRequestHandler):
     server_version = "CubeJ1Config/1.0"
 
@@ -634,6 +678,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
         try:
             save_config(cfg)
             self.server.config = cfg
+            sync_avahi_hostname(cfg.get("device_id", ""))
             if params.get("restart_bridge", [""])[0] == "1":
                 restart_bridge()
             self._send(200, self._render_form(message="Saved"))
@@ -697,6 +742,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
             save_config(cfg)
             self.server.config = cfg
+            sync_avahi_hostname(cfg.get("device_id", ""))
             restart_bridge()
             self._send(200, self._render_form(message="Config imported"))
         except Exception as e:
@@ -1035,6 +1081,7 @@ p {{ line-height: 1.5; }}
 def main():
     cfg = load_config()
     port = int(cfg.get("web_port", 8080))
+    sync_avahi_hostname(cfg.get("device_id", ""))
     httpd = HTTPServer(("0.0.0.0", port), ConfigHandler)
     httpd.config = cfg
     log("config server start port={}".format(port))
