@@ -748,6 +748,8 @@ def _encode_str(s):
     b = s.encode("utf-8")
     return struct.pack(">H", len(b)) + b
 
+MQTT_OUT_QUEUE_MAX = 200
+
 class MQTTClient(object):
     def __init__(self, host, port, client_id, username=None, password=None):
         self.host      = host
@@ -757,6 +759,47 @@ class MQTTClient(object):
         self.password  = password
         self.sock      = None
         self._out_queue = collections.deque()
+
+    def start(self):
+        """Connect in the background and keep reconnecting on failure.
+
+        Wi-SUN polling must not stall just because MQTT is unreachable,
+        so the actual (re)connect attempts run on their own thread;
+        publish()/ping() only ever touch a socket that already exists
+        and otherwise queue/no-op instead of blocking the caller.
+        """
+        t = threading.Thread(target=self._keepalive_loop)
+        t.daemon = True
+        t.start()
+
+    def _keepalive_loop(self):
+        while True:
+            if self.sock is None:
+                try:
+                    self.connect()
+                except Exception as e:
+                    log("MQTT connect failed: {} - retry in 15s".format(e))
+                    write_status(mqtt_connected=False,
+                                 last_error="MQTT connect failed: {}".format(e))
+                    time.sleep(15)
+                    continue
+            time.sleep(5)
+
+    def _drop_connection(self, reason):
+        log("MQTT connection dropped: {}".format(reason))
+        write_status(mqtt_connected=False,
+                     last_error="MQTT error: {}".format(reason))
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+    def _queue(self, topic, payload, retain):
+        self._out_queue.append((topic, payload, retain))
+        while len(self._out_queue) > MQTT_OUT_QUEUE_MAX:
+            self._out_queue.popleft()
 
     def connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -833,37 +876,16 @@ class MQTTClient(object):
         return struct.pack("B", fixed) + _encode_remaining(len(remaining)) + remaining
 
     def publish(self, topic, payload, retain=False):
-        pkt = self._make_pkt(topic, payload, retain)
-        try:
-            if not self.sock:
-                raise RuntimeError("No MQTT socket")
-            self.sock.sendall(pkt)
+        sock = self.sock
+        if not sock:
+            self._queue(topic, payload, retain)
             return
+        try:
+            sock.sendall(self._make_pkt(topic, payload, retain))
         except Exception as e:
             log("MQTT publish error: {}".format(e))
-            write_status(mqtt_connected=False,
-                         last_error="MQTT publish error: {}".format(e))
-            # try reconnect and resend
-            try:
-                self._reconnect()
-            except Exception as e2:
-                log("MQTT reconnect failed after publish error: {}".format(e2))
-                # queue the message for later delivery
-                try:
-                    self._out_queue.append((topic, payload, retain))
-                except Exception:
-                    pass
-                return
-
-            try:
-                self.sock.sendall(pkt)
-                return
-            except Exception as e3:
-                log("MQTT publish retry failed: {}".format(e3))
-                try:
-                    self._out_queue.append((topic, payload, retain))
-                except Exception:
-                    pass
+            self._drop_connection(e)
+            self._queue(topic, payload, retain)
 
     def _flush_queue(self):
         while self._out_queue and self.sock:
@@ -877,51 +899,23 @@ class MQTTClient(object):
                 break
 
     def ping(self):
+        sock = self.sock
+        if not sock:
+            return
         try:
-            self.sock.sendall(b"\xC0\x00")
+            sock.sendall(b"\xC0\x00")
+            r, _, _ = select.select([sock], [], [], 5)
+            if not r:
+                raise RuntimeError("PINGRESP timeout (no data within 5s)")
+            resp = sock.recv(2)
+            if not resp or len(resp) < 2:
+                raise RuntimeError("PINGRESP incomplete response (len={})".format(len(resp)))
+            first_byte = resp[0] if isinstance(resp[0], int) else ord(resp[0])
+            if first_byte != 0xD0:
+                raise RuntimeError("PINGRESP unexpected first_byte=0x{:02X}".format(first_byte))
         except Exception as e:
             log("MQTT ping error: {}".format(e))
-            self._reconnect()
-            return
-        # wait for PINGRESP (should be 0xD0 0x00)
-        try:
-            r, _, _ = select.select([self.sock], [], [], 5)
-            if r:
-                resp = self.sock.recv(2)
-                if not resp:
-                    log("MQTT ping: no response (empty)")
-                    self._reconnect()
-                elif len(resp) < 2:
-                    log("MQTT ping: incomplete response (len={})".format(len(resp)))
-                    self._reconnect()
-                else:
-                    first_byte = resp[0] if isinstance(resp[0], int) else ord(resp[0])
-                    if first_byte != 0xD0:
-                        log("MQTT ping: unexpected response first_byte=0x{:02X}".format(first_byte))
-                        self._reconnect()
-            else:
-                log("MQTT ping: timeout (no data within 5s)")
-                self._reconnect()
-        except Exception as e:
-            log("MQTT ping recv error: {}".format(e))
-            self._reconnect()
-
-    def _reconnect(self):
-        log("MQTT reconnecting …")
-        write_status(mqtt_connected=False)
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
-        while True:
-            try:
-                self.connect()
-                return
-            except Exception as e:
-                log("MQTT reconnect failed: {} - retry in 15s".format(e))
-                time.sleep(15)
+            self._drop_connection(e)
 
 # ---------------------------------------------------------------------------
 # Home Assistant MQTT auto-discovery
@@ -1066,18 +1060,10 @@ def main():
                  last_values={},
                  last_error="")
 
-    # Connect MQTT
+    # Connect MQTT in the background; Wi-SUN setup below must not wait on it
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
                       username=ha_user, password=ha_pass)
-    while True:
-        try:
-            mqtt.connect()
-            break
-        except Exception as e:
-            log("MQTT connect failed: {} - retry in 15s".format(e))
-            write_status(mqtt_connected=False,
-                         last_error="MQTT connect failed: {}".format(e))
-            time.sleep(15)
+    mqtt.start()
 
     publish_ha_discovery(mqtt, device_id)
     publish_bridge_status(mqtt, device_id)
