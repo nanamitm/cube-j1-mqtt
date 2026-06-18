@@ -40,6 +40,7 @@ OTA_APPLY_SCRIPT = "/data/local/apply_ota_update.sh"
 OTA_VERSION_PATH = "/data/local/cube-j1-mqtt.version"
 OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
+SERIAL_LOG_PATH = "/data/local/serial.log"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
@@ -84,7 +85,7 @@ INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port"])
 def log(msg):
     try:
         with open(LOG_PATH, "a") as f:
-            f.write("[{}] {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+            f.write("[{}] {}\n".format(now_str(), msg))
     except Exception:
         pass
 
@@ -150,8 +151,12 @@ def validate_config_values(cfg):
     return errors
 
 
+JST_OFFSET_SECONDS = 9 * 3600
+
 def now_str():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    # The device clock runs in UTC with no timezone configured, so apply a
+    # fixed JST (UTC+9) offset here rather than relying on system tzdata.
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + JST_OFFSET_SECONDS))
 
 
 def load_ota_status():
@@ -244,6 +249,10 @@ def load_ota_log(max_bytes=8192):
 
 def load_bridge_log(max_bytes=8192):
     return tail_log_file(BRIDGE_LOG_PATH, max_bytes)
+
+
+def load_serial_log(max_bytes=8192):
+    return tail_log_file(SERIAL_LOG_PATH, max_bytes)
 
 
 def is_safe_zip_name(name):
@@ -377,15 +386,15 @@ def start_ota_apply(manifest):
         "}",
         "fail() {",
         "  MSG=\"$1\"",
-        "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] apply failed: $MSG\" >> $LOG",
+        "  echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply failed: $MSG\" >> $LOG",
         "  restore_backups",
         "  cat > $STATUS <<JSON",
-        "{\"state\":\"rolled_back\",\"message\":\"OTA apply failed and rollback was attempted: $MSG\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + version + "\"}",
+        "{\"state\":\"rolled_back\",\"message\":\"OTA apply failed and rollback was attempted: $MSG\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + version + "\"}",
         "JSON",
         "  start mqtt_ha_bridge >/dev/null 2>&1",
         "  exit 1",
         "}",
-        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] apply start version={}\" >> $LOG".format(version),
+        "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply start version={}\" >> $LOG".format(version),
     ]
     lines.extend(shell_status_heredoc("applying", "Applying OTA update", version))
     lines.extend([
@@ -414,7 +423,7 @@ def start_ota_apply(manifest):
     ])
     lines.extend(shell_status_heredoc("success", "OTA update applied; services restarted", version))
     lines.extend([
-        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] apply success version={}\" >> $LOG".format(version),
+        "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply success version={}\" >> $LOG".format(version),
         "stop cubej_web_ui >/dev/null 2>&1",
         "sleep 1",
         "start cubej_web_ui >/dev/null 2>&1",
@@ -433,14 +442,14 @@ def start_ota_rollback():
         "STATUS={}".format(shell_quote(OTA_STATUS_PATH)),
         "fail() {",
         "  MSG=\"$1\"",
-        "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback failed: $MSG\" >> $LOG",
+        "  echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] manual rollback failed: $MSG\" >> $LOG",
         "  cat > $STATUS <<JSON",
-        "{\"state\":\"failed\",\"message\":\"Manual rollback failed: $MSG\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + load_current_version() + "\"}",
+        "{\"state\":\"failed\",\"message\":\"Manual rollback failed: $MSG\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + load_current_version() + "\"}",
         "JSON",
         "  start mqtt_ha_bridge >/dev/null 2>&1",
         "  exit 1",
         "}",
-        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback start\" >> $LOG",
+        "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] manual rollback start\" >> $LOG",
         "cat > $STATUS <<'JSON'",
         make_status_json("applying", "Rolling back to previous OTA backup", load_current_version()),
         "JSON",
@@ -462,9 +471,9 @@ def start_ota_rollback():
         "ROLLED_BACK_VERSION=$(cat {} 2>/dev/null)".format(shell_quote(OTA_VERSION_PATH)),
         "start mqtt_ha_bridge >/dev/null 2>&1",
         "cat > $STATUS <<JSON",
-        "{\"state\":\"rolled_back\",\"message\":\"Manual rollback applied; services restarted\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"$ROLLED_BACK_VERSION\"}",
+        "{\"state\":\"rolled_back\",\"message\":\"Manual rollback applied; services restarted\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"$ROLLED_BACK_VERSION\"}",
         "JSON",
-        "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
+        "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
         "stop cubej_web_ui >/dev/null 2>&1",
         "sleep 1",
         "start cubej_web_ui >/dev/null 2>&1",
@@ -557,6 +566,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             self._send(200, tail_log_file(BRIDGE_LOG_PATH, 262144) or "No log yet\n",
+                       "text/plain; charset=utf-8")
+            return
+        if self.path == "/serial.log":
+            if not self._require_auth():
+                return
+            self._send(200, tail_log_file(SERIAL_LOG_PATH, 262144) or "No log yet\n",
                        "text/plain; charset=utf-8")
             return
         if self.path not in ("/", "/index.html"):
@@ -835,6 +850,31 @@ p {{ line-height: 1.5; }}
 </form>
 {config_tools}
 </main>
+<script>
+(function() {{
+    function refreshLog(url, boxId) {{
+        fetch(url).then(function(r) {{ return r.text(); }}).then(function(text) {{
+            var box = document.getElementById(boxId);
+            if (!box) return;
+            if (!text || text === "No log yet") {{
+                box.innerHTML = '<p class="muted">No log yet.</p>';
+                return;
+            }}
+            var pre = box.firstElementChild;
+            if (!pre || pre.tagName !== "PRE") {{
+                box.innerHTML = "<pre></pre>";
+                pre = box.firstElementChild;
+            }}
+            pre.textContent = text;
+            pre.scrollTop = pre.scrollHeight;
+        }}).catch(function() {{}});
+    }}
+    setInterval(function() {{
+        refreshLog("/mqtt_bridge.log", "bridge-log-box");
+        refreshLog("/serial.log", "serial-log-box");
+    }}, 5000);
+}})();
+</script>
 </body>
 </html>
 """.format(message=message_html, errors=error_html, status=status_html,
@@ -941,6 +981,11 @@ p {{ line-height: 1.5; }}
         if bridge_log:
             bridge_log_html = "<pre>{}</pre>".format(html_escape(bridge_log))
 
+        serial_log = load_serial_log()
+        serial_log_html = '<p class="muted">No serial log yet.</p>'
+        if serial_log:
+            serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
+
         return """<section class="panel">
 <h2>Status</h2>
 <div class="grid">
@@ -960,9 +1005,12 @@ p {{ line-height: 1.5; }}
 <p class="code">Polling EPCs: {polling}</p>
 <p class="code">Gettable EPCs: {gettable}</p>
 <p><a href="/status.json">status.json</a></p>
-<h3>Bridge Log (last 8KB)</h3>
-{bridge_log_html}
+<h3>Bridge Log (last 8KB, auto-refreshes)</h3>
+<div id="bridge-log-box">{bridge_log_html}</div>
 <p><a href="/mqtt_bridge.log">mqtt_bridge.log (full)</a></p>
+<h3>Serial Log /dev/ttyS1 (last 8KB, auto-refreshes)</h3>
+<div id="serial-log-box">{serial_log_html}</div>
+<p><a href="/serial.log">serial.log (full)</a></p>
 </section>""".format(
             wifi_ssid=html_escape(wifi_ssid),
             mqtt=self._bool_status(status.get("mqtt_connected")),
@@ -980,7 +1028,8 @@ p {{ line-height: 1.5; }}
             values="\n".join(value_rows),
             polling=html_escape(polling),
             gettable=html_escape(gettable),
-            bridge_log_html=bridge_log_html)
+            bridge_log_html=bridge_log_html,
+            serial_log_html=serial_log_html)
 
 
 def main():

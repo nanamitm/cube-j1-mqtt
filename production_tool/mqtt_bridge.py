@@ -24,6 +24,7 @@ import datetime
 
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
+SERIAL_LOG_PATH = "/data/local/serial.log"
 STATUS_PATH = "/data/local/mqtt_status.json"
 OTA_STATUS_PATH = "/data/local/ota_status.json"
 
@@ -50,10 +51,11 @@ def led_read():
     return tuple(result)
 
 _log_file = None
+_serial_log_file = None
 _status = {}
 
 def log(msg):
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    ts = now_str()
     line = "[{}] {}\n".format(ts, msg)
     global _log_file
     if _log_file:
@@ -65,6 +67,18 @@ def log(msg):
     else:
         sys.stderr.write(line)
         sys.stderr.flush()
+
+def serial_log(direction, data):
+    if not _serial_log_file:
+        return
+    if isinstance(data, bytes):
+        data = data.decode("ascii", "replace")
+    ts = now_str()
+    try:
+        _serial_log_file.write("[{}] {} {}\n".format(ts, direction, data.rstrip("\r\n")))
+        _serial_log_file.flush()
+    except Exception:
+        pass
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -114,8 +128,12 @@ def wait_for_config():
             log("Config load failed: {} - retry in 10s".format(e))
         time.sleep(10)
 
+JST_OFFSET_SECONDS = 9 * 3600
+
 def now_str():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    # The device clock runs in UTC with no timezone configured, so apply a
+    # fixed JST (UTC+9) offset here rather than relying on system tzdata.
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + JST_OFFSET_SECONDS))
 
 def write_status(**kwargs):
     global _status
@@ -202,6 +220,7 @@ def open_serial(port, baud=115200):
     return fd
 
 def serial_write(fd, data):
+    serial_log("TX", data)
     if isinstance(data, bytes):
         os.write(fd, data)
     else:
@@ -223,8 +242,14 @@ def serial_readline(fd, timeout=10):
             continue
         buf += ch
         if buf.endswith(b"\r\n"):
-            return buf[:-2].decode("ascii", errors="replace")
-    return buf.decode("ascii", errors="replace") if buf else None
+            line = buf[:-2].decode("ascii", errors="replace")
+            serial_log("RX", line)
+            return line
+    if buf:
+        line = buf.decode("ascii", errors="replace")
+        serial_log("RX", line)
+        return line
+    return None
 
 def _led_blink(stop_event, colors, interval=0.2):
     i = 0
@@ -946,9 +971,13 @@ def publish_bridge_status(mqtt, device_id):
 # ---------------------------------------------------------------------------
 
 def main():
-    global _log_file
+    global _log_file, _serial_log_file
     try:
         _log_file = open(LOG_PATH, "a")
+    except Exception:
+        pass
+    try:
+        _serial_log_file = open(SERIAL_LOG_PATH, "a")
     except Exception:
         pass
 
