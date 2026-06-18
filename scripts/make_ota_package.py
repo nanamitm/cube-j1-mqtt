@@ -76,7 +76,7 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
 
     manifest = build_manifest(root, args.version)
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, indent=2) + "\n")
         for item in FILES:
             zf.write(root / item["source"], item["path"])

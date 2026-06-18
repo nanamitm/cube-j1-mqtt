@@ -385,7 +385,7 @@ def start_ota_apply(manifest):
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(OTA_APPLY_SCRIPT, 0o755)
-    os.system("/system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(OTA_APPLY_SCRIPT)))
+    os.system("setsid /system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(OTA_APPLY_SCRIPT)))
 
 
 def start_ota_rollback():
@@ -429,7 +429,7 @@ def start_ota_rollback():
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(OTA_APPLY_SCRIPT, 0o755)
-    os.system("/system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(OTA_APPLY_SCRIPT)))
+    os.system("setsid /system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(OTA_APPLY_SCRIPT)))
 
 
 def html_escape(s):
