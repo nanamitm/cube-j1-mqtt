@@ -894,15 +894,13 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
     def _render_form(self, message=None, errors=None):
         cfg = load_config()
-        status_html = self._render_status(load_status())
+        status = load_status()
+        status_html = self._render_status(status, cfg)
+        measurements_html = self._render_measurements(status)
+        logs_html = self._render_logs()
         ota_html = self._render_ota_panel(load_ota_status())
         config_tools_html = self._render_config_tools()
-        rows = []
-        for key, label, input_type in FIELDS:
-            value = html_escape(cfg.get(key, DEFAULTS.get(key, "")))
-            rows.append(
-                '<label><span>{}</span><input name="{}" type="{}" value="{}"></label>'.format(
-                    html_escape(label), html_escape(key), input_type, value))
+        config_html = self._render_config_form(cfg)
 
         error_html = ""
         if errors:
@@ -916,56 +914,71 @@ class ConfigHandler(BaseHTTPRequestHandler):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Cube J1 MQTT Config</title>
 <style>
-body {{ font-family: sans-serif; margin: 0; background: #f6f7f9; color: #202124; }}
-main {{ max-width: 760px; margin: 0 auto; padding: 24px; }}
-h1 {{ font-size: 24px; margin: 0 0 18px; }}
-form {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; }}
-.panel {{ background: #fff; border: 1px solid #d8dde3; padding: 18px; margin-bottom: 18px; }}
-.panel h2 {{ font-size: 18px; margin: 0 0 12px; }}
-.panel h3 {{ font-size: 14px; margin: 16px 0 8px; color: #5f6368; }}
-.grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; }}
-.item span {{ display: block; color: #5f6368; font-size: 13px; margin-bottom: 3px; }}
-.item strong {{ font-size: 16px; overflow-wrap: anywhere; }}
+* {{ box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f4f6f8; color: #202124; }}
+main {{ max-width: 980px; margin: 0 auto; padding: 24px; }}
+h1 {{ font-size: 24px; margin: 0; }}
+h2 {{ font-size: 18px; margin: 0 0 14px; }}
+h3 {{ font-size: 14px; margin: 18px 0 10px; color: #5f6368; }}
+p {{ line-height: 1.5; margin: 10px 0; }}
+a {{ color: #1a5fb4; }}
+.topbar {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }}
+.subtitle {{ color: #5f6368; font-size: 13px; }}
+.panel {{ background: #fff; border: 1px solid #d8dde3; border-radius: 8px; padding: 18px; margin-bottom: 16px; }}
+.grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
+.item {{ min-width: 0; }}
+.item span {{ display: block; color: #5f6368; font-size: 12px; margin-bottom: 4px; }}
+.item strong {{ font-size: 15px; overflow-wrap: anywhere; }}
 .ok {{ color: #137333; }}
 .bad {{ color: #a50e0e; }}
 .muted {{ color: #5f6368; }}
-.values {{ margin-top: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 18px; }}
+.pill {{ display: inline-block; border: 1px solid currentColor; border-radius: 999px; padding: 2px 8px; font-size: 13px; }}
+.values {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
 .code {{ font-family: monospace; font-size: 13px; overflow-wrap: anywhere; }}
-label {{ display: grid; grid-template-columns: 210px 1fr; gap: 12px; align-items: center; margin: 10px 0; }}
-input {{ font-size: 16px; padding: 8px; border: 1px solid #b9c0c8; }}
+.form-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }}
+.fieldset {{ border: 1px solid #e1e5ea; border-radius: 8px; padding: 14px; }}
+.fieldset h3 {{ margin-top: 0; }}
+label {{ display: grid; gap: 6px; margin: 10px 0; }}
+label span {{ color: #5f6368; font-size: 13px; }}
+input {{ width: 100%; font-size: 16px; padding: 8px; border: 1px solid #b9c0c8; border-radius: 4px; background: #fff; color: #202124; }}
 input[type=file] {{ border: 0; padding-left: 0; }}
 .actions {{ display: flex; gap: 16px; align-items: center; margin-top: 18px; flex-wrap: wrap; }}
 .actions label {{ display: flex; gap: 8px; align-items: center; margin: 0; }}
 .actions input[type=checkbox] {{ width: auto; }}
-button {{ font-size: 16px; padding: 9px 18px; border: 1px solid #2f6fed; background: #2f6fed; color: #fff; }}
-.message {{ background: #e6f4ea; border: 1px solid #9ad0a6; padding: 10px; margin-bottom: 12px; }}
-.error {{ background: #fce8e6; border: 1px solid #f2a39b; padding: 10px; margin-bottom: 12px; }}
-pre {{ background: #202124; color: #f1f3f4; padding: 10px; overflow: auto; font-size: 12px; max-height: 260px; }}
-p {{ line-height: 1.5; }}
-@media (max-width: 620px) {{ label, .grid, .values {{ grid-template-columns: 1fr; gap: 4px; }} main {{ padding: 16px; }} }}
+button {{ font-size: 16px; padding: 9px 18px; border: 1px solid #2f6fed; border-radius: 4px; background: #2f6fed; color: #fff; }}
+button.secondary {{ border-color: #b9c0c8; background: #fff; color: #202124; }}
+button:disabled {{ opacity: .5; }}
+.message {{ background: #e6f4ea; border: 1px solid #9ad0a6; border-radius: 6px; padding: 10px; margin-bottom: 12px; }}
+.error {{ background: #fce8e6; border: 1px solid #f2a39b; border-radius: 6px; padding: 10px; margin-bottom: 12px; }}
+pre {{ background: #202124; color: #f1f3f4; padding: 12px; overflow: auto; font-size: 12px; max-height: 260px; border-radius: 6px; }}
+details {{ border-top: 1px solid #e1e5ea; padding-top: 12px; margin-top: 12px; }}
+summary {{ cursor: pointer; font-weight: 600; }}
+@media (max-width: 760px) {{ .grid, .values, .form-grid {{ grid-template-columns: 1fr; }} main {{ padding: 16px; }} .panel {{ padding: 14px; }} }}
 </style>
 </head>
 <body>
 <main>
+<div class="topbar">
 <h1>Cube J1 MQTT Config</h1>
+<div class="subtitle">HTTP API / MQTT bridge maintenance</div>
+</div>
 {message}
 {errors}
 {status}
+{measurements}
+{config}
+<section class="panel">
+<h2>Maintenance</h2>
 {ota}
-<form method="post" action="/save">
-{rows}
-<div class="actions">
-<button type="submit">Save</button>
-<label><input type="checkbox" name="restart_bridge" value="1" checked> Restart MQTT bridge</label>
-</div>
-</form>
-<p>Changing the web port takes effect after reboot or service restart. Port 80 is reserved by the device's built-in nginx and cannot be used.</p>
+{config_tools}
 <form method="post" action="/reboot" onsubmit="return confirm('Reboot the device now?');">
 <div class="actions">
-<button type="submit">Reboot Device</button>
+<button type="submit" class="secondary">Reboot Device</button>
 </div>
 </form>
-{config_tools}
+<p class="muted">Changing the web port takes effect after reboot or service restart. Port 80 is reserved by the device's built-in nginx and cannot be used.</p>
+</section>
+{logs}
 </main>
 <script>
 (function() {{
@@ -995,7 +1008,41 @@ p {{ line-height: 1.5; }}
 </body>
 </html>
 """.format(message=message_html, errors=error_html, status=status_html,
-           ota=ota_html, rows="\n".join(rows), config_tools=config_tools_html)
+           measurements=measurements_html, config=config_html, ota=ota_html,
+           config_tools=config_tools_html, logs=logs_html)
+
+    def _render_config_form(self, cfg):
+        labels = dict([(key, (label, input_type)) for key, label, input_type in FIELDS])
+        groups = [
+            ("B-route", ["br_id", "br_pwd"]),
+            ("MQTT", ["mqtt_host", "mqtt_port", "mqtt_user", "mqtt_pass"]),
+            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass"]),
+        ]
+
+        sections = []
+        for title, keys in groups:
+            rows = []
+            for key in keys:
+                label, input_type = labels[key]
+                value = html_escape(cfg.get(key, DEFAULTS.get(key, "")))
+                rows.append(
+                    '<label><span>{}</span><input name="{}" type="{}" value="{}"></label>'.format(
+                        html_escape(label), html_escape(key), input_type, value))
+            sections.append('<div class="fieldset"><h3>{}</h3>{}</div>'.format(
+                html_escape(title), "\n".join(rows)))
+
+        return """<section class="panel">
+<h2>Config</h2>
+<form method="post" action="/save">
+<div class="form-grid">
+{sections}
+</div>
+<div class="actions">
+<button type="submit">Save</button>
+<label><input type="checkbox" name="restart_bridge" value="1" checked> Restart MQTT bridge</label>
+</div>
+</form>
+</section>""".format(sections="\n".join(sections))
 
     def _status_value(self, status, key, default="-"):
         value = status.get(key, default)
@@ -1016,8 +1063,8 @@ p {{ line-height: 1.5; }}
             log_html = "<pre>{}</pre>".format(html_escape(ota_log))
         rollback_attrs = "" if has_ota_backup() else ' disabled title="No OTA backup is available to roll back to"'
 
-        return """<section class="panel">
-<h2>OTA Update</h2>
+        return """<div class="fieldset">
+<h3>OTA Update</h3>
 <div class="grid">
 <div class="item"><span>Current version</span><strong>{current_version}</strong></div>
 <div class="item"><span>Last package version</span><strong>{version}</strong></div>
@@ -1038,7 +1085,7 @@ p {{ line-height: 1.5; }}
 </div>
 </form>
 {log_html}
-</section>""".format(
+</div>""".format(
             current_version=html_escape(current_version),
             version=html_escape(version),
             state_class=state_class,
@@ -1049,8 +1096,8 @@ p {{ line-height: 1.5; }}
             log_html=log_html)
 
     def _render_config_tools(self):
-        return """<section class="panel">
-<h2>Config Backup</h2>
+        return """<div class="fieldset">
+<h3>Config Backup</h3>
 <p><a href="/config.json">Download config.json</a></p>
 <form method="post" action="/config/import" enctype="multipart/form-data">
 <label><span>Import config</span><input name="config" type="file" accept=".json"></label>
@@ -1058,7 +1105,7 @@ p {{ line-height: 1.5; }}
 <button type="submit">Import Config</button>
 </div>
 </form>
-</section>"""
+</div>"""
 
     def _bool_status(self, value):
         if value is True:
@@ -1067,15 +1114,69 @@ p {{ line-height: 1.5; }}
             return '<strong class="bad">disconnected</strong>'
         return '<strong class="muted">unknown</strong>'
 
-    def _render_status(self, status):
+    def _render_measurements(self, status):
         values = status.get("last_values") or {}
         value_rows = []
-        for key in sorted(values.keys()):
+        labels = [
+            ("power_w", "Power", " W"),
+            ("energy_forward_kwh", "Forward energy", " kWh"),
+            ("energy_reverse_kwh", "Reverse energy", " kWh"),
+            ("current_r_a", "Current R", " A"),
+            ("current_t_a", "Current T", " A"),
+            ("one_minute_energy_forward_kwh", "1-min forward energy", " kWh"),
+            ("one_minute_energy_reverse_kwh", "1-min reverse energy", " kWh"),
+            ("fixed_time_energy_forward_kwh", "Fixed-time forward energy", " kWh"),
+            ("fixed_time_energy_reverse_kwh", "Fixed-time reverse energy", " kWh"),
+            ("operation_status", "Operation status", ""),
+            ("fault_status", "Fault status", ""),
+            ("meter_date", "Meter date", ""),
+            ("meter_time", "Meter time", ""),
+        ]
+        used = set()
+        for key, label, unit in labels:
+            if key in values:
+                used.add(key)
+                value_rows.append('<div class="item"><span>{}</span><strong>{}{}</strong></div>'.format(
+                    html_escape(label), html_escape(values[key]), html_escape(unit)))
+        for key in sorted([k for k in values.keys() if k not in used]):
             value_rows.append('<div class="item"><span>{}</span><strong>{}</strong></div>'.format(
                 html_escape(key), html_escape(values[key])))
         if not value_rows:
             value_rows.append('<div class="item"><span>values</span><strong class="muted">none yet</strong></div>')
 
+        return """<section class="panel">
+<h2>Measurements</h2>
+<div class="values">{values}</div>
+</section>""".format(values="\n".join(value_rows))
+
+    def _render_logs(self):
+        bridge_log = load_bridge_log()
+        bridge_log_html = '<p class="muted">No bridge log yet.</p>'
+        if bridge_log:
+            bridge_log_html = "<pre>{}</pre>".format(html_escape(bridge_log))
+
+        serial_log = load_serial_log()
+        serial_log_html = '<p class="muted">No serial log yet.</p>'
+        if serial_log:
+            serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
+
+        return """<section class="panel">
+<h2>Logs</h2>
+<details open>
+<summary>Bridge Log</summary>
+<div id="bridge-log-box">{bridge_log_html}</div>
+<p><a href="/mqtt_bridge.log">mqtt_bridge.log (full)</a></p>
+</details>
+<details>
+<summary>Serial Log /dev/ttyS1</summary>
+<div id="serial-log-box">{serial_log_html}</div>
+<p><a href="/serial.log">serial.log (full)</a></p>
+</details>
+</section>""".format(
+            bridge_log_html=bridge_log_html,
+            serial_log_html=serial_log_html)
+
+    def _render_status(self, status, cfg):
         gettable = ", ".join(status.get("gettable_epcs") or [])
         polling = ", ".join(status.get("polling_epcs") or [])
         if not gettable:
@@ -1092,47 +1193,35 @@ p {{ line-height: 1.5; }}
             missing_config = "-"
 
         wifi_ssid = get_wifi_ssid() or "-"
-
-        bridge_log = load_bridge_log()
-        bridge_log_html = '<p class="muted">No bridge log yet.</p>'
-        if bridge_log:
-            bridge_log_html = "<pre>{}</pre>".format(html_escape(bridge_log))
-
-        serial_log = load_serial_log()
-        serial_log_html = '<p class="muted">No serial log yet.</p>'
-        if serial_log:
-            serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
+        device_id = cfg.get("device_id", status.get("device_id", "cubej1"))
+        web_port = cfg.get("web_port", 8080)
+        discovery = "_cubej1-mqtt._tcp / {}.local:{}".format(sanitize_hostname(device_id), web_port)
 
         return """<section class="panel">
 <h2>Status</h2>
 <div class="grid">
-<div class="item"><span>Configuration</span><strong class="{config_class}">{config_state}</strong></div>
+<div class="item"><span>Configuration</span><strong class="pill {config_class}">{config_state}</strong></div>
 <div class="item"><span>Missing config</span><strong>{missing_config}</strong></div>
 <div class="item"><span>Wi-Fi SSID</span><strong>{wifi_ssid}</strong></div>
 <div class="item"><span>MQTT</span>{mqtt}</div>
 <div class="item"><span>Wi-SUN</span>{wisun}</div>
 <div class="item"><span>Device ID</span><strong>{device_id}</strong></div>
+<div class="item"><span>Discovery</span><strong>{discovery}</strong></div>
 <div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
 <div class="item"><span>Bridge started</span><strong>{started}</strong></div>
 <div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
 <div class="item"><span>Updated</span><strong>{updated}</strong></div>
 <div class="item"><span>Last error</span><strong class="{error_class}">{last_error}</strong></div>
 </div>
-<div class="values">{values}</div>
 <p class="code">Polling EPCs: {polling}</p>
 <p class="code">Gettable EPCs: {gettable}</p>
 <p><a href="/status.json">status.json</a></p>
-<h3>Bridge Log (last 8KB, auto-refreshes)</h3>
-<div id="bridge-log-box">{bridge_log_html}</div>
-<p><a href="/mqtt_bridge.log">mqtt_bridge.log (full)</a></p>
-<h3>Serial Log /dev/ttyS1 (last 8KB, auto-refreshes)</h3>
-<div id="serial-log-box">{serial_log_html}</div>
-<p><a href="/serial.log">serial.log (full)</a></p>
 </section>""".format(
             wifi_ssid=html_escape(wifi_ssid),
             mqtt=self._bool_status(status.get("mqtt_connected")),
             wisun=self._bool_status(status.get("wisun_connected")),
             device_id=self._status_value(status, "device_id"),
+            discovery=html_escape(discovery),
             meter_ipv6=self._status_value(status, "meter_ipv6"),
             started=self._status_value(status, "bridge_started_at"),
             last_measurement=self._status_value(status, "last_measurement_at"),
@@ -1142,11 +1231,8 @@ p {{ line-height: 1.5; }}
             missing_config=html_escape(missing_config),
             error_class=error_class,
             last_error=html_escape(last_error),
-            values="\n".join(value_rows),
             polling=html_escape(polling),
-            gettable=html_escape(gettable),
-            bridge_log_html=bridge_log_html,
-            serial_log_html=serial_log_html)
+            gettable=html_escape(gettable))
 
 
 def main():
