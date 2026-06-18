@@ -151,8 +151,8 @@ def validate_config_values(cfg):
         errors.append("web_port 80 is already used by the device's built-in nginx; choose another port")
     if cfg.get("mqtt_port", 0) < 1 or cfg.get("mqtt_port", 0) > 65535:
         errors.append("mqtt_port must be between 1 and 65535")
-    if cfg.get("poll_interval", 0) < 1:
-        errors.append("poll_interval must be greater than 0")
+    if cfg.get("poll_interval", 0) < 30:
+        errors.append("poll_interval must be 30 seconds or more (Wi-SUN duty cycle limit)")
     if not str(cfg.get("web_user", "")):
         errors.append("web_user must not be empty")
     return errors
