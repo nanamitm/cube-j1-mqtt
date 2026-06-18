@@ -1009,9 +1009,12 @@ summary {{ cursor: pointer; font-weight: 600; }}
     var sectionNames = ["status", "measurements", "config", "maintenance", "logs"];
     var buttons = Array.prototype.slice.call(document.querySelectorAll(".nav button[data-target]"));
     var sections = Array.prototype.slice.call(document.querySelectorAll("[data-section]"));
+    var activeSection = "";
+    var logTimer = null;
 
     function showSection(name, replace) {{
         if (sectionNames.indexOf(name) < 0) name = "status";
+        activeSection = name;
         sections.forEach(function(section) {{
             section.hidden = section.getAttribute("data-section") !== name;
         }});
@@ -1021,6 +1024,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
             button.setAttribute("aria-current", active ? "page" : "false");
         }});
         if (replace) history.replaceState(null, "", "#" + name);
+        updateLogPolling();
     }}
 
     buttons.forEach(function(button) {{
@@ -1050,10 +1054,23 @@ summary {{ cursor: pointer; font-weight: 600; }}
             pre.scrollTop = pre.scrollHeight;
         }}).catch(function() {{}});
     }}
-    setInterval(function() {{
+
+    function refreshLogs() {{
         refreshLog("/mqtt_bridge.log", "bridge-log-box");
         refreshLog("/serial.log", "serial-log-box");
-    }}, 5000);
+    }}
+
+    function updateLogPolling() {{
+        if (activeSection === "logs") {{
+            refreshLogs();
+            if (!logTimer) {{
+                logTimer = setInterval(refreshLogs, 5000);
+            }}
+        }} else if (logTimer) {{
+            clearInterval(logTimer);
+            logTimer = null;
+        }}
+    }}
 }})();
 </script>
 </body>
