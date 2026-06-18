@@ -916,7 +916,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
 <style>
 * {{ box-sizing: border-box; }}
 body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f4f6f8; color: #202124; }}
-main {{ max-width: 980px; margin: 0 auto; padding: 24px; }}
+main {{ max-width: 1160px; margin: 0 auto; padding: 24px; }}
 h1 {{ font-size: 24px; margin: 0; }}
 h2 {{ font-size: 18px; margin: 0 0 14px; }}
 h3 {{ font-size: 14px; margin: 18px 0 10px; color: #5f6368; }}
@@ -924,7 +924,13 @@ p {{ line-height: 1.5; margin: 10px 0; }}
 a {{ color: #1a5fb4; }}
 .topbar {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }}
 .subtitle {{ color: #5f6368; font-size: 13px; }}
+.shell {{ display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 18px; align-items: start; }}
+.nav {{ position: sticky; top: 16px; display: grid; gap: 8px; }}
+.nav button {{ width: 100%; text-align: left; border-color: #d8dde3; background: #fff; color: #202124; }}
+.nav button.active {{ border-color: #2f6fed; background: #e8f0fe; color: #174ea6; }}
+.content {{ min-width: 0; }}
 .panel {{ background: #fff; border: 1px solid #d8dde3; border-radius: 8px; padding: 18px; margin-bottom: 16px; }}
+.panel[hidden] {{ display: none; }}
 .grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }}
 .item {{ min-width: 0; }}
 .item span {{ display: block; color: #5f6368; font-size: 12px; margin-bottom: 4px; }}
@@ -953,7 +959,14 @@ button:disabled {{ opacity: .5; }}
 pre {{ background: #202124; color: #f1f3f4; padding: 12px; overflow: auto; font-size: 12px; max-height: 260px; border-radius: 6px; }}
 details {{ border-top: 1px solid #e1e5ea; padding-top: 12px; margin-top: 12px; }}
 summary {{ cursor: pointer; font-weight: 600; }}
-@media (max-width: 760px) {{ .grid, .values, .form-grid {{ grid-template-columns: 1fr; }} main {{ padding: 16px; }} .panel {{ padding: 14px; }} }}
+@media (max-width: 760px) {{
+    .shell {{ display: block; }}
+    .nav {{ position: static; display: flex; gap: 8px; overflow-x: auto; margin-bottom: 12px; padding-bottom: 4px; }}
+    .nav button {{ width: auto; flex: 0 0 auto; white-space: nowrap; }}
+    .grid, .values, .form-grid {{ grid-template-columns: 1fr; }}
+    main {{ padding: 16px; }}
+    .panel {{ padding: 14px; }}
+}}
 </style>
 </head>
 <body>
@@ -964,14 +977,23 @@ summary {{ cursor: pointer; font-weight: 600; }}
 </div>
 {message}
 {errors}
+<div class="shell">
+<nav class="nav" aria-label="Sections">
+<button type="button" data-target="status">Status</button>
+<button type="button" data-target="measurements">Measurements</button>
+<button type="button" data-target="config">Config</button>
+<button type="button" data-target="maintenance">Maintenance</button>
+<button type="button" data-target="logs">Logs</button>
+</nav>
+<div class="content">
 {status}
 {measurements}
 {config}
-<section class="panel">
+<section class="panel" data-section="maintenance">
 <h2>Maintenance</h2>
 {ota}
 {config_tools}
-<form method="post" action="/reboot" onsubmit="return confirm('Reboot the device now?');">
+<form method="post" action="/reboot#maintenance" onsubmit="return confirm('Reboot the device now?');">
 <div class="actions">
 <button type="submit" class="secondary">Reboot Device</button>
 </div>
@@ -979,9 +1001,38 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <p class="muted">Changing the web port takes effect after reboot or service restart. Port 80 is reserved by the device's built-in nginx and cannot be used.</p>
 </section>
 {logs}
+</div>
+</div>
 </main>
 <script>
 (function() {{
+    var sectionNames = ["status", "measurements", "config", "maintenance", "logs"];
+    var buttons = Array.prototype.slice.call(document.querySelectorAll(".nav button[data-target]"));
+    var sections = Array.prototype.slice.call(document.querySelectorAll("[data-section]"));
+
+    function showSection(name, replace) {{
+        if (sectionNames.indexOf(name) < 0) name = "status";
+        sections.forEach(function(section) {{
+            section.hidden = section.getAttribute("data-section") !== name;
+        }});
+        buttons.forEach(function(button) {{
+            var active = button.getAttribute("data-target") === name;
+            button.className = active ? "active" : "";
+            button.setAttribute("aria-current", active ? "page" : "false");
+        }});
+        if (replace) history.replaceState(null, "", "#" + name);
+    }}
+
+    buttons.forEach(function(button) {{
+        button.onclick = function() {{
+            showSection(button.getAttribute("data-target"), true);
+        }};
+    }});
+    window.onhashchange = function() {{
+        showSection(location.hash.replace(/^#/, ""), false);
+    }};
+    showSection(location.hash.replace(/^#/, ""), false);
+
     function refreshLog(url, boxId) {{
         fetch(url).then(function(r) {{ return r.text(); }}).then(function(text) {{
             var box = document.getElementById(boxId);
@@ -1031,9 +1082,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
             sections.append('<div class="fieldset"><h3>{}</h3>{}</div>'.format(
                 html_escape(title), "\n".join(rows)))
 
-        return """<section class="panel">
+        return """<section class="panel" data-section="config">
 <h2>Config</h2>
-<form method="post" action="/save">
+<form method="post" action="/save#config">
 <div class="form-grid">
 {sections}
 </div>
@@ -1072,14 +1123,14 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>Updated</span><strong>{updated}</strong></div>
 </div>
 <p>{message}</p>
-<form method="post" action="/ota/upload" enctype="multipart/form-data">
+<form method="post" action="/ota/upload#maintenance" enctype="multipart/form-data">
 <label><span>Update package</span><input name="package" type="file" accept=".zip"></label>
 <div class="actions">
 <button type="submit">Upload OTA</button>
 <a href="/ota_status.json">ota_status.json</a>
 </div>
 </form>
-<form method="post" action="/ota/rollback">
+<form method="post" action="/ota/rollback#maintenance">
 <div class="actions">
 <button type="submit"{rollback_attrs}>Rollback OTA</button>
 </div>
@@ -1099,7 +1150,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         return """<div class="fieldset">
 <h3>Config Backup</h3>
 <p><a href="/config.json">Download config.json</a></p>
-<form method="post" action="/config/import" enctype="multipart/form-data">
+<form method="post" action="/config/import#maintenance" enctype="multipart/form-data">
 <label><span>Import config</span><input name="config" type="file" accept=".json"></label>
 <div class="actions">
 <button type="submit">Import Config</button>
@@ -1144,7 +1195,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if not value_rows:
             value_rows.append('<div class="item"><span>values</span><strong class="muted">none yet</strong></div>')
 
-        return """<section class="panel">
+        return """<section class="panel" data-section="measurements">
 <h2>Measurements</h2>
 <div class="values">{values}</div>
 </section>""".format(values="\n".join(value_rows))
@@ -1160,7 +1211,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if serial_log:
             serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
 
-        return """<section class="panel">
+        return """<section class="panel" data-section="logs">
 <h2>Logs</h2>
 <details open>
 <summary>Bridge Log</summary>
@@ -1197,7 +1248,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         web_port = cfg.get("web_port", 8080)
         discovery = "_cubej1-mqtt._tcp / {}.local:{}".format(sanitize_hostname(device_id), web_port)
 
-        return """<section class="panel">
+        return """<section class="panel" data-section="status">
 <h2>Status</h2>
 <div class="grid">
 <div class="item"><span>Configuration</span><strong class="pill {config_class}">{config_state}</strong></div>
