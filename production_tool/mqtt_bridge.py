@@ -293,6 +293,9 @@ SCAN_RETRY_LIMIT = 10
 
 MAX_CONSECUTIVE_TIMEOUTS = 3
 
+PROPERTY_MAP_MAX_RETRIES = 3
+PROPERTY_MAP_RETRY_DELAY = 3
+
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
 # ---------------------------------------------------------------------------
@@ -631,34 +634,45 @@ def send_el_get(fd, ipv6, tid, epcs=None):
     serial_write(fd, b"\r\n")
 
 def detect_poll_epcs(fd, ipv6, tid):
-    send_el_get(fd, ipv6, tid, [PROPERTY_MAP_EPC])
-    data = read_erxudp(fd, timeout=15)
-    if not data:
-        log("Get property map timeout; polling default EPCs only")
-        write_status(gettable_epcs=[],
-                     polling_epcs=epcs_to_hex(DEFAULT_EPCS),
-                     last_error="Get property map timeout")
-        return list(DEFAULT_EPCS)
+    """Get the property map and derive poll_epcs; returns (poll_epcs, tid).
 
-    props = parse_el_response(data)
-    if PROPERTY_MAP_EPC not in props:
-        log("Get property map unavailable; polling default EPCs only")
-        write_status(gettable_epcs=[],
-                     polling_epcs=epcs_to_hex(DEFAULT_EPCS),
-                     last_error="Get property map unavailable")
-        return list(DEFAULT_EPCS)
+    Retries a few times before falling back to DEFAULT_EPCS, since a
+    single timeout/empty response is often transient (radio noise, a
+    busy meter) rather than the meter actually lacking a property map.
+    """
+    for attempt in range(1, PROPERTY_MAP_MAX_RETRIES + 1):
+        send_el_get(fd, ipv6, tid, [PROPERTY_MAP_EPC])
+        request_tid = tid
+        tid = (tid + 1) & 0xFFFF
+        data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
+        if data:
+            props = parse_el_response(data)
+            if PROPERTY_MAP_EPC in props:
+                supported = parse_property_map(props[PROPERTY_MAP_EPC])
+                log("Gettable EPCs: {}".format(format_epcs(supported)))
+                poll_epcs = list(DEFAULT_EPCS)
+                for epc in EXTRA_EPCS:
+                    if epc in supported and epc not in poll_epcs:
+                        poll_epcs.append(epc)
+                log("Polling EPCs: {}".format(format_epcs(poll_epcs)))
+                write_status(gettable_epcs=epcs_to_hex(sorted(supported)),
+                             polling_epcs=epcs_to_hex(poll_epcs),
+                             last_error="")
+                return poll_epcs, tid
+            log("Get property map unavailable (attempt {}/{})".format(
+                attempt, PROPERTY_MAP_MAX_RETRIES))
+        else:
+            log("Get property map timeout (attempt {}/{})".format(
+                attempt, PROPERTY_MAP_MAX_RETRIES))
+        if attempt < PROPERTY_MAP_MAX_RETRIES:
+            time.sleep(PROPERTY_MAP_RETRY_DELAY)
 
-    supported = parse_property_map(props[PROPERTY_MAP_EPC])
-    log("Gettable EPCs: {}".format(format_epcs(supported)))
-    poll_epcs = list(DEFAULT_EPCS)
-    for epc in EXTRA_EPCS:
-        if epc in supported and epc not in poll_epcs:
-            poll_epcs.append(epc)
-    log("Polling EPCs: {}".format(format_epcs(poll_epcs)))
-    write_status(gettable_epcs=epcs_to_hex(sorted(supported)),
-                 polling_epcs=epcs_to_hex(poll_epcs),
-                 last_error="")
-    return poll_epcs
+    log("Get property map failed after {} attempts; polling default EPCs only".format(
+        PROPERTY_MAP_MAX_RETRIES))
+    write_status(gettable_epcs=[],
+                 polling_epcs=epcs_to_hex(DEFAULT_EPCS),
+                 last_error="Get property map failed after retries")
+    return list(DEFAULT_EPCS), tid
 
 def reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs):
     """Re-join Wi-SUN and re-detect polling EPCs.
@@ -672,15 +686,22 @@ def reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs):
                  meter_ipv6=ipv6,
                  last_error="")
     try:
-        poll_epcs = detect_poll_epcs(fd, ipv6, tid)
-        tid = (tid + 1) & 0xFFFF
+        poll_epcs, tid = detect_poll_epcs(fd, ipv6, tid)
     except Exception as e3:
         log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
         write_status(last_error="EPC detection after reconnect failed: {}".format(e3))
     return ipv6, poll_epcs, tid
 
-def read_erxudp(fd, timeout=15):
-    """Wait for ERXUDP and return payload as bytearray, or None."""
+def read_erxudp(fd, timeout=15, expected_tid=None):
+    """Wait for ERXUDP and return payload as bytearray, or None.
+
+    If expected_tid is given, frames whose ECHONET Lite TID doesn't
+    match are skipped instead of being returned. Without this, a
+    delayed or duplicated response to an earlier request (the meter
+    is known to retransmit) can be mistaken for the answer to the
+    current one, e.g. a stale property-map reply consumed by the next
+    measurement poll.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
@@ -694,9 +715,17 @@ def read_erxudp(fd, timeout=15):
                 if not hex_data.startswith("1081"):
                     continue
                 try:
-                    return bytearray(binascii.unhexlify(hex_data))
+                    frame = bytearray(binascii.unhexlify(hex_data))
                 except Exception as e:
                     log("ERXUDP hex decode error: {}".format(e))
+                    continue
+                if expected_tid is not None and len(frame) >= 4:
+                    frame_tid = struct.unpack(">H", bytes(frame[2:4]))[0]
+                    if frame_tid != expected_tid:
+                        log("ERXUDP TID mismatch (got {:04X}, expected {:04X}) - ignoring stale response".format(
+                            frame_tid, expected_tid))
+                        continue
+                return frame
     return None
 
 # ---------------------------------------------------------------------------
@@ -1089,8 +1118,7 @@ def main():
     last_status_publish = 0
     consecutive_timeouts = 0
     try:
-        poll_epcs = detect_poll_epcs(fd, ipv6, tid)
-        tid = (tid + 1) & 0xFFFF
+        poll_epcs, tid = detect_poll_epcs(fd, ipv6, tid)
     except Exception as e:
         log("EPC detection failed: {} - polling default EPCs only".format(e))
         poll_epcs = list(DEFAULT_EPCS)
@@ -1101,8 +1129,9 @@ def main():
             led_rgb(0, 0, 255)
             try:
                 send_el_get(fd, ipv6, tid, poll_epcs)
+                request_tid = tid
                 tid = (tid + 1) & 0xFFFF
-                data = read_erxudp(fd, timeout=15)
+                data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
                 if data:
                     props = parse_el_response(data)
                     m     = decode_measurements(props)
