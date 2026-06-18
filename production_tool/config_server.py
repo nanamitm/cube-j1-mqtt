@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import zipfile
@@ -85,6 +86,7 @@ FIELDS = [
 ]
 
 INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port"])
+SECTION_NAMES = ["status", "measurements", "config", "maintenance", "logs"]
 
 
 def log(msg):
@@ -424,6 +426,7 @@ def start_ota_apply(manifest):
     lines.extend([
         "cp {} {} 2>/dev/null".format(shell_quote(OTA_VERSION_PATH), shell_quote(OTA_VERSION_PATH + ".bak")),
         "echo {} > {} || fail {}".format(shell_quote(version), shell_quote(OTA_VERSION_PATH), shell_quote("write version")),
+        "/usr/bin/python /data/local/config_server.py --sync-avahi >> $LOG 2>&1 || fail {}".format(shell_quote("sync avahi")),
         "start mqtt_ha_bridge >/dev/null 2>&1",
     ])
     lines.extend(shell_status_heredoc("success", "OTA update applied; services restarted", version))
@@ -474,6 +477,7 @@ def start_ota_rollback():
             shell_quote(OTA_VERSION_PATH + ".bak"),
             shell_quote(OTA_VERSION_PATH)),
         "ROLLED_BACK_VERSION=$(cat {} 2>/dev/null)".format(shell_quote(OTA_VERSION_PATH)),
+        "/usr/bin/python /data/local/config_server.py --sync-avahi >> $LOG 2>&1 || fail {}".format(shell_quote("sync avahi")),
         "start mqtt_ha_bridge >/dev/null 2>&1",
         "cat > $STATUS <<JSON",
         "{\"state\":\"rolled_back\",\"message\":\"Manual rollback applied; services restarted\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"$ROLLED_BACK_VERSION\"}",
@@ -495,6 +499,31 @@ def html_escape(s):
 
 def xml_escape(s):
     return html_escape(s)
+
+
+def normalize_section_name(value, default="status"):
+    name = str(value or "").strip().lower()
+    if name in SECTION_NAMES:
+        return name
+    return default
+
+
+def form_value(form, name, default=""):
+    try:
+        value = form.getfirst(name)
+    except Exception:
+        value = None
+    if value in (None, ""):
+        return default
+    return value
+
+
+def parse_post_params(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    raw = handler.rfile.read(length)
+    if not isinstance(raw, str):
+        raw = raw.decode("utf-8")
+    return parse_qs(raw, keep_blank_values=True)
 
 
 def restart_bridge():
@@ -694,7 +723,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
-        self._send(200, self._render_form())
+            self._send(200, self._render_form())
 
     def do_POST(self):
         if self.path == "/ota/upload":
@@ -705,11 +734,13 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if self.path == "/ota/rollback":
             if not self._require_auth():
                 return
+            params = parse_post_params(self)
+            active_section = normalize_section_name(params.get("next_section", ["maintenance"])[0], "maintenance")
             if not has_ota_backup():
-                self._send(400, self._render_form(errors=["No OTA backup is available to roll back to"], message="Rollback failed"))
+                self._send(400, self._render_form(errors=["No OTA backup is available to roll back to"], message="Rollback failed", active_section=active_section))
                 return
             start_ota_rollback()
-            self._send(200, self._render_form(message="OTA rollback accepted. Services will restart."))
+            self._send(200, self._render_form(message="OTA rollback accepted. Services will restart.", active_section=active_section))
             return
         if self.path == "/config/import":
             if not self._require_auth():
@@ -719,8 +750,10 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if self.path == "/reboot":
             if not self._require_auth():
                 return
+            params = parse_post_params(self)
+            active_section = normalize_section_name(params.get("next_section", ["maintenance"])[0], "maintenance")
             reboot_device()
-            self._send(200, self._render_form(message="Reboot requested. The device will restart in a few seconds."))
+            self._send(200, self._render_form(message="Reboot requested. The device will restart in a few seconds.", active_section=active_section))
             return
 
         if self.path != "/save":
@@ -729,11 +762,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
 
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
-        if not isinstance(raw, str):
-            raw = raw.decode("utf-8")
-        params = parse_qs(raw, keep_blank_values=True)
+        params = parse_post_params(self)
+        active_section = normalize_section_name(params.get("next_section", ["config"])[0], "config")
         cfg = load_config()
 
         errors = []
@@ -743,7 +773,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
         errors.extend(validate_config_values(cfg))
 
         if errors:
-            self._send(400, self._render_form(errors=errors, message="Save failed"))
+            self._send(400, self._render_form(errors=errors, message="Save failed", active_section=active_section))
             return
 
         try:
@@ -752,10 +782,10 @@ class ConfigHandler(BaseHTTPRequestHandler):
             sync_avahi(cfg)
             if params.get("restart_bridge", [""])[0] == "1":
                 restart_bridge()
-            self._send(200, self._render_form(message="Saved"))
+            self._send(200, self._render_form(message="Saved", active_section=active_section))
         except Exception as e:
             log("save failed: {}".format(e))
-            self._send(500, self._render_form(errors=[str(e)], message="Save failed"))
+            self._send(500, self._render_form(errors=[str(e)], message="Save failed", active_section=active_section))
 
     def _handle_config_import(self):
         try:
@@ -763,21 +793,24 @@ class ConfigHandler(BaseHTTPRequestHandler):
         except ImportError:
             self._send(500, self._render_form(
                 errors=["This Python runtime does not provide cgi.FieldStorage"],
-                message="Config import failed"))
+                message="Config import failed",
+                active_section="maintenance"))
             return
 
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):
             self._send(400, self._render_form(
                 errors=["Config import must be multipart/form-data"],
-                message="Config import failed"))
+                message="Config import failed",
+                active_section="maintenance"))
             return
 
         length = int(self.headers.get("Content-Length", "0"))
         if length < 1 or length > MAX_CONFIG_IMPORT_SIZE:
             self._send(400, self._render_form(
                 errors=["Config import size must be between 1 byte and {} bytes".format(MAX_CONFIG_IMPORT_SIZE)],
-                message="Config import failed"))
+                message="Config import failed",
+                active_section="maintenance"))
             return
 
         try:
@@ -791,6 +824,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 })
             if "config" not in form.keys():
                 raise ValueError("No config file was uploaded")
+            active_section = normalize_section_name(form_value(form, "next_section", "maintenance"), "maintenance")
             item = form["config"]
             if isinstance(item, list):
                 item = item[0]
@@ -808,17 +842,17 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
             errors = validate_config_values(cfg)
             if errors:
-                self._send(400, self._render_form(errors=errors, message="Config import failed"))
+                self._send(400, self._render_form(errors=errors, message="Config import failed", active_section=active_section))
                 return
 
             save_config(cfg)
             self.server.config = cfg
             sync_avahi(cfg)
             restart_bridge()
-            self._send(200, self._render_form(message="Config imported"))
+            self._send(200, self._render_form(message="Config imported", active_section=active_section))
         except Exception as e:
             log("config import failed: {}".format(e))
-            self._send(400, self._render_form(errors=[str(e)], message="Config import failed"))
+            self._send(400, self._render_form(errors=[str(e)], message="Config import failed", active_section="maintenance"))
 
     def _handle_ota_upload(self):
         try:
@@ -826,21 +860,24 @@ class ConfigHandler(BaseHTTPRequestHandler):
         except ImportError:
             self._send(500, self._render_form(
                 errors=["This Python runtime does not provide cgi.FieldStorage"],
-                message="OTA upload failed"))
+                message="OTA upload failed",
+                active_section="maintenance"))
             return
 
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):
             self._send(400, self._render_form(
                 errors=["OTA upload must be multipart/form-data"],
-                message="OTA upload failed"))
+                message="OTA upload failed",
+                active_section="maintenance"))
             return
 
         length = int(self.headers.get("Content-Length", "0"))
         if length < 1 or length > MAX_OTA_PACKAGE_SIZE:
             self._send(400, self._render_form(
                 errors=["OTA package size must be between 1 byte and {} bytes".format(MAX_OTA_PACKAGE_SIZE)],
-                message="OTA upload failed"))
+                message="OTA upload failed",
+                active_section="maintenance"))
             return
 
         try:
@@ -854,6 +891,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 })
             if "package" not in form.keys():
                 raise ValueError("No OTA package was uploaded")
+            active_section = normalize_section_name(form_value(form, "next_section", "maintenance"), "maintenance")
             item = form["package"]
             if isinstance(item, list):
                 item = item[0]
@@ -886,15 +924,16 @@ class ConfigHandler(BaseHTTPRequestHandler):
             version = str(manifest.get("version", ""))
             write_ota_status("uploaded", "OTA package uploaded and validated", version)
             start_ota_apply(manifest)
-            self._send(200, self._render_form(message="OTA update accepted. Services will restart."))
+            self._send(200, self._render_form(message="OTA update accepted. Services will restart.", active_section=active_section))
         except Exception as e:
             log("ota upload failed: {}".format(e))
             write_ota_status("failed", "OTA upload failed: {}".format(e))
-            self._send(400, self._render_form(errors=[str(e)], message="OTA upload failed"))
+            self._send(400, self._render_form(errors=[str(e)], message="OTA upload failed", active_section="maintenance"))
 
-    def _render_form(self, message=None, errors=None):
+    def _render_form(self, message=None, errors=None, active_section="status"):
         cfg = load_config()
         status = load_status()
+        active_section = normalize_section_name(active_section, "status")
         status_html = self._render_status(status, cfg)
         measurements_html = self._render_measurements(status)
         logs_html = self._render_logs()
@@ -994,6 +1033,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 {ota}
 {config_tools}
 <form method="post" action="/reboot#maintenance" onsubmit="return confirm('Reboot the device now?');">
+<input type="hidden" name="next_section" value="maintenance">
 <div class="actions">
 <button type="submit" class="secondary">Reboot Device</button>
 </div>
@@ -1009,6 +1049,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
     var sectionNames = ["status", "measurements", "config", "maintenance", "logs"];
     var buttons = Array.prototype.slice.call(document.querySelectorAll(".nav button[data-target]"));
     var sections = Array.prototype.slice.call(document.querySelectorAll("[data-section]"));
+    var initialSection = "{initial_section}";
     var activeSection = "";
     var logTimer = null;
 
@@ -1035,7 +1076,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
     window.onhashchange = function() {{
         showSection(location.hash.replace(/^#/, ""), false);
     }};
-    showSection(location.hash.replace(/^#/, ""), false);
+    showSection(location.hash.replace(/^#/, "") || initialSection, false);
+    if (!location.hash && initialSection && initialSection !== "status") {{
+        history.replaceState(null, "", "#" + initialSection);
+    }}
 
     function refreshLog(url, boxId) {{
         fetch(url).then(function(r) {{ return r.text(); }}).then(function(text) {{
@@ -1077,7 +1121,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
 </html>
 """.format(message=message_html, errors=error_html, status=status_html,
            measurements=measurements_html, config=config_html, ota=ota_html,
-           config_tools=config_tools_html, logs=logs_html)
+           config_tools=config_tools_html, logs=logs_html,
+           initial_section=html_escape(active_section))
 
     def _render_config_form(self, cfg):
         labels = dict([(key, (label, input_type)) for key, label, input_type in FIELDS])
@@ -1102,6 +1147,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         return """<section class="panel" data-section="config">
 <h2>Config</h2>
 <form method="post" action="/save#config">
+<input type="hidden" name="next_section" value="config">
 <div class="form-grid">
 {sections}
 </div>
@@ -1141,6 +1187,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 </div>
 <p>{message}</p>
 <form method="post" action="/ota/upload#maintenance" enctype="multipart/form-data">
+<input type="hidden" name="next_section" value="maintenance">
 <label><span>Update package</span><input name="package" type="file" accept=".zip"></label>
 <div class="actions">
 <button type="submit">Upload OTA</button>
@@ -1148,6 +1195,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 </div>
 </form>
 <form method="post" action="/ota/rollback#maintenance">
+<input type="hidden" name="next_section" value="maintenance">
 <div class="actions">
 <button type="submit"{rollback_attrs}>Rollback OTA</button>
 </div>
@@ -1168,6 +1216,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <h3>Config Backup</h3>
 <p><a href="/config.json">Download config.json</a></p>
 <form method="post" action="/config/import#maintenance" enctype="multipart/form-data">
+<input type="hidden" name="next_section" value="maintenance">
 <label><span>Import config</span><input name="config" type="file" accept=".json"></label>
 <div class="actions">
 <button type="submit">Import Config</button>
@@ -1304,6 +1353,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--sync-avahi":
+        sync_avahi(load_config())
+        return
     cfg = load_config()
     port = int(cfg.get("web_port", 8080))
     sync_avahi(cfg)
