@@ -291,6 +291,8 @@ def skcommand(fd, cmd, timeout=10):
 SCAN_DURATION_BASE = 4
 SCAN_RETRY_LIMIT = 10
 
+MAX_CONSECUTIVE_TIMEOUTS = 3
+
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
 # ---------------------------------------------------------------------------
@@ -657,6 +659,25 @@ def detect_poll_epcs(fd, ipv6, tid):
                  polling_epcs=epcs_to_hex(poll_epcs),
                  last_error="")
     return poll_epcs
+
+def reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs):
+    """Re-join Wi-SUN and re-detect polling EPCs.
+
+    Raises if wisun_connect() itself fails. If EPC re-detection fails,
+    logs it and keeps the previously known poll_epcs.
+    """
+    ipv6 = wisun_connect(fd, br_id, br_pwd)
+    log("Wi-SUN reconnected at {}".format(ipv6))
+    write_status(wisun_connected=True,
+                 meter_ipv6=ipv6,
+                 last_error="")
+    try:
+        poll_epcs = detect_poll_epcs(fd, ipv6, tid)
+        tid = (tid + 1) & 0xFFFF
+    except Exception as e3:
+        log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
+        write_status(last_error="EPC detection after reconnect failed: {}".format(e3))
+    return ipv6, poll_epcs, tid
 
 def read_erxudp(fd, timeout=15):
     """Wait for ERXUDP and return payload as bytearray, or None."""
@@ -1066,6 +1087,7 @@ def main():
     unit_kwh  = 1.0
     last_ping = time.time()
     last_status_publish = 0
+    consecutive_timeouts = 0
     try:
         poll_epcs = detect_poll_epcs(fd, ipv6, tid)
         tid = (tid + 1) & 0xFFFF
@@ -1101,11 +1123,24 @@ def main():
                                  wisun_connected=True,
                                  last_error="")
                     publish_measurements(mqtt, device_id, m)
+                    consecutive_timeouts = 0
                 else:
-                    log("No ERXUDP response (timeout)")
+                    consecutive_timeouts += 1
+                    log("No ERXUDP response (timeout) ({}/{})".format(
+                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS))
                     write_status(last_error="No ERXUDP response (timeout)")
             finally:
                 led_rgb(*orig_led)
+
+            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+                log("{} consecutive timeouts - forcing Wi-SUN reconnect".format(consecutive_timeouts))
+                try:
+                    ipv6, poll_epcs, tid = reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs)
+                except Exception as e2:
+                    log("Wi-SUN reconnect after repeated timeouts failed: {}".format(e2))
+                    write_status(wisun_connected=False,
+                                 last_error="Wi-SUN reconnect failed: {}".format(e2))
+                consecutive_timeouts = 0
 
             if time.time() - last_ping > 50:
                 mqtt.ping()
@@ -1121,6 +1156,7 @@ def main():
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
             write_status(wisun_connected=False,
                          last_error="Main loop error: {}".format(e))
+            consecutive_timeouts = 0
             try:
                 publish_bridge_status(mqtt, device_id)
                 last_status_publish = time.time()
@@ -1128,17 +1164,7 @@ def main():
                 log("Status publish failed: {}".format(e_pub))
             time.sleep(30)
             try:
-                ipv6 = wisun_connect(fd, br_id, br_pwd)
-                log("Wi-SUN reconnected at {}".format(ipv6))
-                write_status(wisun_connected=True,
-                             meter_ipv6=ipv6,
-                             last_error="")
-                try:
-                    poll_epcs = detect_poll_epcs(fd, ipv6, tid)
-                    tid = (tid + 1) & 0xFFFF
-                except Exception as e3:
-                    log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
-                    write_status(last_error="EPC detection after reconnect failed: {}".format(e3))
+                ipv6, poll_epcs, tid = reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs)
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))
                 write_status(wisun_connected=False,
