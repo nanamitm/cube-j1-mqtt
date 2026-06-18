@@ -21,9 +21,11 @@ import zipfile
 
 try:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+    from SocketServer import ThreadingMixIn
     from urlparse import parse_qs
 except ImportError:
     from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
     from urllib.parse import parse_qs
 
 try:
@@ -1108,7 +1110,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if (activeSection === "logs") {{
             refreshLogs();
             if (!logTimer) {{
-                logTimer = setInterval(refreshLogs, 5000);
+                logTimer = setInterval(refreshLogs, 1000);
             }}
         }} else if (logTimer) {{
             clearInterval(logTimer);
@@ -1352,6 +1354,12 @@ summary {{ cursor: pointer; font-weight: 600; }}
             gettable=html_escape(gettable))
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    # Each client (browser tab polling logs/status, an OTA upload, a config
+    # save, ...) gets its own thread so a slow request can't stall others.
+    daemon_threads = True
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--sync-avahi":
         sync_avahi(load_config())
@@ -1359,7 +1367,7 @@ def main():
     cfg = load_config()
     port = int(cfg.get("web_port", 8080))
     sync_avahi(cfg)
-    httpd = HTTPServer(("0.0.0.0", port), ConfigHandler)
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), ConfigHandler)
     httpd.config = cfg
     log("config server start port={}".format(port))
     httpd.serve_forever()
