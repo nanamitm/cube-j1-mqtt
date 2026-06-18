@@ -9,6 +9,22 @@
 - **文字コード**: レスポンスは全て`UTF-8`。
 - **重要な注意**: `POST`系エンドポイント（`/save`, `/reboot`, `/ota/upload`, `/ota/rollback`, `/config/import`）は**レスポンスボディがHTML**（Web UIのページ全体を再レンダリングしたもの）です。JSONは返りません。成功/失敗の判定は**HTTPステータスコード**（`200`=成功、`400`/`500`=失敗）で行い、詳細な状態を知りたい場合は直後に`GET /status.json`や`GET /ota_status.json`を呼んでください。
 
+## 自動検出（mDNS / DNS-SD）
+
+`config_server.py`は起動時および設定保存時にAvahiのサービス定義を同期し、LAN内のクライアントからDNS-SDで検出できるようにします。
+
+| 項目 | 値 |
+|---|---|
+| Service type | `_cubej1-mqtt._tcp.` |
+| Service name | `Cube J1 MQTT %h`（`%h`はAvahiのホスト名） |
+| Port | `config.json`の`web_port`（デフォルト`8080`） |
+| TXT `device_id` | `config.json`の`device_id` |
+| TXT `api` | `/status.json` |
+| TXT `path` | `/` |
+| TXT `version` | `/data/local/cube-j1-mqtt.version`の内容。未取得時は`unknown` |
+
+Androidクライアントでは`NsdManager.discoverServices("_cubej1-mqtt._tcp.", ...)`で候補を列挙し、解決したホスト・ポートに対して通常のHTTP Basic認証付きAPIアクセスを行う。
+
 ---
 
 ## GET エンドポイント（JSON / テキスト）
