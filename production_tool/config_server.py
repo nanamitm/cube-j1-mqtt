@@ -195,6 +195,34 @@ def load_current_version():
         return ""
 
 
+def has_ota_backup():
+    return all(os.path.isfile(target + ".bak") for target in OTA_ALLOWED_TARGETS)
+
+
+def get_wifi_ssid():
+    # wpa_cli creates a reply socket using the caller's umask; under the
+    # service's default (restrictive) umask, wpa_supplicant (running as a
+    # different user) can't connect back to deliver the reply and the
+    # command times out, so relax the umask just for this call.
+    tmp_path = "/data/local/.wifi_status.tmp"
+    old_umask = os.umask(0)
+    try:
+        os.system("wpa_cli -p /data/misc/wifi/sockets -i wlan0 status > {} 2>&1".format(shell_quote(tmp_path)))
+    except Exception:
+        return ""
+    finally:
+        os.umask(old_umask)
+    try:
+        with open(tmp_path) as f:
+            output = f.read()
+        for line in output.splitlines():
+            if line.startswith("ssid="):
+                return line[len("ssid="):].strip()
+    except Exception:
+        pass
+    return ""
+
+
 def load_ota_log(max_bytes=8192):
     try:
         size = os.path.getsize(OTA_LOG_PATH)
@@ -371,6 +399,7 @@ def start_ota_apply(manifest):
         ])
 
     lines.extend([
+        "cp {} {} 2>/dev/null".format(shell_quote(OTA_VERSION_PATH), shell_quote(OTA_VERSION_PATH + ".bak")),
         "echo {} > {} || fail {}".format(shell_quote(version), shell_quote(OTA_VERSION_PATH), shell_quote("write version")),
         "start mqtt_ha_bridge >/dev/null 2>&1",
     ])
@@ -417,9 +446,14 @@ def start_ota_rollback():
             "fi",
         ])
     lines.extend([
+        "if [ -f {} ]; then cp {} {}; fi".format(
+            shell_quote(OTA_VERSION_PATH + ".bak"),
+            shell_quote(OTA_VERSION_PATH + ".bak"),
+            shell_quote(OTA_VERSION_PATH)),
+        "ROLLED_BACK_VERSION=$(cat {} 2>/dev/null)".format(shell_quote(OTA_VERSION_PATH)),
         "start mqtt_ha_bridge >/dev/null 2>&1",
-        "cat > $STATUS <<'JSON'",
-        make_status_json("rolled_back", "Manual rollback applied; services restarted", load_current_version()),
+        "cat > $STATUS <<JSON",
+        "{\"state\":\"rolled_back\",\"message\":\"Manual rollback applied; services restarted\",\"updated_at\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"$ROLLED_BACK_VERSION\"}",
         "JSON",
         "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
         "stop cubej_web_ui >/dev/null 2>&1",
@@ -525,6 +559,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/ota/rollback":
             if not self._require_auth():
+                return
+            if not has_ota_backup():
+                self._send(400, self._render_form(errors=["No OTA backup is available to roll back to"], message="Rollback failed"))
                 return
             start_ota_rollback()
             self._send(200, self._render_form(message="OTA rollback accepted. Services will restart."))
@@ -804,6 +841,7 @@ p {{ line-height: 1.5; }}
         log_html = '<p class="muted">No OTA log yet.</p>'
         if ota_log:
             log_html = "<pre>{}</pre>".format(html_escape(ota_log))
+        rollback_attrs = "" if has_ota_backup() else ' disabled title="No OTA backup is available to roll back to"'
 
         return """<section class="panel">
 <h2>OTA Update</h2>
@@ -823,7 +861,7 @@ p {{ line-height: 1.5; }}
 </form>
 <form method="post" action="/ota/rollback">
 <div class="actions">
-<button type="submit">Rollback OTA</button>
+<button type="submit"{rollback_attrs}>Rollback OTA</button>
 </div>
 </form>
 {log_html}
@@ -834,6 +872,7 @@ p {{ line-height: 1.5; }}
             state=html_escape(state),
             updated=html_escape(updated),
             message=html_escape(message),
+            rollback_attrs=rollback_attrs,
             log_html=log_html)
 
     def _render_config_tools(self):
@@ -879,11 +918,14 @@ p {{ line-height: 1.5; }}
         if not missing_config:
             missing_config = "-"
 
+        wifi_ssid = get_wifi_ssid() or "-"
+
         return """<section class="panel">
 <h2>Status</h2>
 <div class="grid">
 <div class="item"><span>Configuration</span><strong class="{config_class}">{config_state}</strong></div>
 <div class="item"><span>Missing config</span><strong>{missing_config}</strong></div>
+<div class="item"><span>Wi-Fi SSID</span><strong>{wifi_ssid}</strong></div>
 <div class="item"><span>MQTT</span>{mqtt}</div>
 <div class="item"><span>Wi-SUN</span>{wisun}</div>
 <div class="item"><span>Device ID</span><strong>{device_id}</strong></div>
@@ -898,6 +940,7 @@ p {{ line-height: 1.5; }}
 <p class="code">Gettable EPCs: {gettable}</p>
 <p><a href="/status.json">status.json</a></p>
 </section>""".format(
+            wifi_ssid=html_escape(wifi_ssid),
             mqtt=self._bool_status(status.get("mqtt_connected")),
             wisun=self._bool_status(status.get("wisun_connected")),
             device_id=self._status_value(status, "device_id"),
