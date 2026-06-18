@@ -723,7 +723,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
-            self._send(200, self._render_form())
+        self._send(200, self._render_form())
 
     def do_POST(self):
         if self.path == "/ota/upload":
