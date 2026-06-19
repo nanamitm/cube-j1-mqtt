@@ -396,7 +396,9 @@ def wisun_connect(fd, br_id, br_pwd):
     channel = pan["Channel"]
     pan_id  = pan["Pan ID"]
     mac     = pan["Addr"]
-    log("PAN found: ch={} panId={} mac={}".format(channel, pan_id, mac))
+    lqi     = pan.get("LQI", "")
+    log("PAN found: ch={} panId={} mac={} lqi={}".format(channel, pan_id, mac, lqi))
+    write_status(wisun_channel=channel, wisun_pan_id=pan_id, wisun_lqi=lqi)
 
     ipv6 = skll64(fd, mac)
     if not ipv6:
@@ -1103,6 +1105,9 @@ def main():
                  mqtt_connected=False,
                  wisun_connected=False,
                  meter_ipv6=None,
+                 wisun_channel=None,
+                 wisun_pan_id=None,
+                 wisun_lqi=None,
                  gettable_epcs=[],
                  polling_epcs=epcs_to_hex(DEFAULT_EPCS),
                  last_measurement_at=None,
