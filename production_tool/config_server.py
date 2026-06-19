@@ -1361,9 +1361,26 @@ summary {{ cursor: pointer; font-weight: 600; }}
         discovery = "_cubej1-mqtt._tcp / {}.local:{}".format(sanitize_hostname(device_id), web_port)
         poll_interval = cfg.get("poll_interval", status.get("poll_interval", 60))
         disk_free = get_disk_free("/data") or "-"
+        last_values = status.get("last_values") or {}
 
         return """<section class="panel" data-section="status">
 <h2>Status</h2>
+<h3>Smart Meter</h3>
+<div class="grid">
+<div class="item"><span>Wi-SUN</span>{wisun}</div>
+<div class="item"><span>Wi-SUN Channel</span><strong>{wisun_channel}</strong></div>
+<div class="item"><span>Wi-SUN PAN ID</span><strong>{wisun_pan_id}</strong></div>
+<div class="item"><span>Wi-SUN LQI</span><strong>{wisun_lqi}</strong></div>
+<div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
+<div class="item"><span>Installation Place</span><strong>{installation_place}</strong></div>
+<div class="item"><span>Maker Code</span><strong>{maker_code}</strong></div>
+<div class="item"><span>Serial Number</span><strong>{serial_number}</strong></div>
+<div class="item"><span>Poll interval</span><strong>{poll_interval}s</strong></div>
+<div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
+</div>
+<p class="code">Polling EPCs: {polling}</p>
+<p class="code">Gettable EPCs: {gettable}</p>
+<h3>Device</h3>
 <div class="grid">
 <div class="item"><span>Configuration</span><strong class="pill {config_class}">{config_state}</strong></div>
 <div class="item"><span>Missing config</span><strong>{missing_config}</strong></div>
@@ -1371,22 +1388,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>IP Address</span><strong>{ip_address}</strong></div>
 <div class="item"><span>MAC Address</span><strong>{mac_address}</strong></div>
 <div class="item"><span>MQTT</span>{mqtt}</div>
-<div class="item"><span>Wi-SUN</span>{wisun}</div>
-<div class="item"><span>Wi-SUN Channel</span><strong>{wisun_channel}</strong></div>
-<div class="item"><span>Wi-SUN PAN ID</span><strong>{wisun_pan_id}</strong></div>
-<div class="item"><span>Wi-SUN LQI</span><strong>{wisun_lqi}</strong></div>
 <div class="item"><span>Device ID</span><strong>{device_id}</strong></div>
 <div class="item"><span>Discovery</span><strong>{discovery}</strong></div>
-<div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
-<div class="item"><span>Poll interval</span><strong>{poll_interval}s</strong></div>
 <div class="item"><span>Disk free (/data)</span><strong>{disk_free}</strong></div>
 <div class="item"><span>Bridge started</span><strong>{started}</strong></div>
-<div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
 <div class="item"><span>Updated</span><strong>{updated}</strong></div>
 <div class="item"><span>Last error</span><strong class="{error_class}">{last_error}</strong></div>
 </div>
-<p class="code">Polling EPCs: {polling}</p>
-<p class="code">Gettable EPCs: {gettable}</p>
 <p><a href="/status.json">status.json</a></p>
 </section>""".format(
             wifi_ssid=html_escape(wifi_ssid),
@@ -1397,6 +1405,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
             wisun_channel=self._status_value(status, "wisun_channel"),
             wisun_pan_id=self._status_value(status, "wisun_pan_id"),
             wisun_lqi=self._status_value(status, "wisun_lqi"),
+            installation_place=self._status_value(last_values, "installation_place"),
+            maker_code=self._status_value(last_values, "maker_code"),
+            serial_number=self._status_value(last_values, "serial_number"),
             device_id=self._status_value(status, "device_id"),
             discovery=html_escape(discovery),
             meter_ipv6=self._status_value(status, "meter_ipv6"),
