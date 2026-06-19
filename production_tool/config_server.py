@@ -14,6 +14,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -46,9 +48,12 @@ OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
 AVAHI_CONF_PATH = "/system/etc/avahi-daemon.conf"
-AVAHI_DATA_DIR = "/data/misc/avahi"
-AVAHI_SERVICE_DIR = "/data/misc/avahi/services"
-AVAHI_SERVICE_PATH = "/data/misc/avahi/services/cube-j1-mqtt.service"
+AVAHI_SERVICE_TYPE = "_cubej1-mqtt._tcp"
+AVAHI_PUBLISH_PID_PATH = "/data/local/avahi_publish.pid"
+# This firmware's dbus-daemon listens on the Android-style socket path below instead of
+# the upstream default (/var/run/dbus/system_bus_socket), which is what avahi-publish-service
+# is linked against, so it must be told explicitly or it reports "Daemon not running".
+AVAHI_DBUS_SYSTEM_BUS_ADDRESS = "unix:path=/dev/socket/dbus"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
@@ -521,10 +526,6 @@ def html_escape(s):
     return _html_escape("" if s is None else str(s), quote=True)
 
 
-def xml_escape(s):
-    return html_escape(s)
-
-
 def normalize_section_name(value, default="status"):
     name = str(value or "").strip().lower()
     if name in SECTION_NAMES:
@@ -565,7 +566,38 @@ def sanitize_hostname(value):
     return name.lower() or "cubej1"
 
 
-def render_avahi_service(cfg):
+def _avahi_publish_pid():
+    try:
+        with open(AVAHI_PUBLISH_PID_PATH) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _avahi_publish_kill_running():
+    pid = _avahi_publish_pid()
+    if pid is None:
+        return
+    try:
+        with open("/proc/{}/cmdline".format(pid)) as f:
+            cmdline = f.read()
+    except Exception:
+        cmdline = ""
+    if "avahi-publish" in cmdline:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception as e:
+            log("avahi-publish-service kill pid={} failed: {}".format(pid, e))
+    try:
+        os.remove(AVAHI_PUBLISH_PID_PATH)
+    except Exception:
+        pass
+
+
+def sync_avahi_publish(cfg):
+    # avahi-daemon only reads service files from /etc/avahi/services, which lives on
+    # the read-only system partition, so the service is registered live over D-Bus
+    # via avahi-publish-service instead of dropping a static .service file.
     device_id = str(cfg.get("device_id", "cubej1") or "cubej1")
     port = int(cfg.get("web_port", 8080))
     version = load_current_version() or "unknown"
@@ -575,57 +607,39 @@ def render_avahi_service(cfg):
         "path=/",
         "version={}".format(version),
     ]
-    txt_html = "\n".join([
-        "    <txt-record>{}</txt-record>".format(xml_escape(item))
-        for item in txt_records
-    ])
-    return """<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">Cube J1 MQTT %h</name>
-  <service>
-    <type>_cubej1-mqtt._tcp</type>
-    <port>{port}</port>
-{txt_records}
-  </service>
-</service-group>
-""".format(port=port, txt_records=txt_html)
 
+    _avahi_publish_kill_running()
 
-def sync_avahi_service(cfg):
-    service_xml = render_avahi_service(cfg)
+    name = "Cube J1 MQTT {}".format(device_id)
+    cmd = ["avahi-publish-service", "--no-fail", "-s", name, AVAHI_SERVICE_TYPE, str(port)] + txt_records
+    env = dict(os.environ)
+    env["DBUS_SYSTEM_BUS_ADDRESS"] = AVAHI_DBUS_SYSTEM_BUS_ADDRESS
     try:
-        if os.path.isfile(AVAHI_SERVICE_PATH):
-            with open(AVAHI_SERVICE_PATH) as f:
-                if f.read() == service_xml:
-                    return False
-    except Exception:
-        pass
-
-    try:
-        if not os.path.isdir(AVAHI_DATA_DIR):
-            os.makedirs(AVAHI_DATA_DIR)
-            os.chmod(AVAHI_DATA_DIR, 0o755)
-        if not os.path.isdir(AVAHI_SERVICE_DIR):
-            os.makedirs(AVAHI_SERVICE_DIR)
-            os.chmod(AVAHI_SERVICE_DIR, 0o755)
-        with open(AVAHI_SERVICE_PATH, "w") as f:
-            f.write(service_xml)
-        os.chmod(AVAHI_SERVICE_PATH, 0o644)
-        log("avahi service file updated path={}".format(AVAHI_SERVICE_PATH))
+        # This stays running long after we return, so it must not inherit our stdio:
+        # leaving stdin attached keeps any caller's pty/pipe (e.g. "adb shell") from
+        # ever seeing EOF, and setsid detaches it from our session entirely.
+        devnull = os.open(os.devnull, os.O_RDWR)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=devnull, stdout=devnull, stderr=devnull,
+                env=env, preexec_fn=os.setsid, close_fds=True)
+        finally:
+            os.close(devnull)
+        with open(AVAHI_PUBLISH_PID_PATH, "w") as f:
+            f.write(str(proc.pid))
+        log("avahi-publish-service started pid={} name={} port={}".format(proc.pid, name, port))
         return True
     except Exception as e:
-        log("avahi service update failed: {}".format(e))
+        log("avahi-publish-service failed to start: {}".format(e))
         return False
 
 
 def sync_avahi(cfg):
     hostname_changed = sync_avahi_hostname(cfg.get("device_id", ""))
-    service_changed = sync_avahi_service(cfg)
-    if hostname_changed or service_changed:
+    if hostname_changed:
         rc = os.system("stop avahi-daemon >/dev/null 2>&1; sleep 1; start avahi-daemon >/dev/null 2>&1")
-        log("avahi restarted hostname_changed={} service_changed={} rc={}".format(
-            hostname_changed, service_changed, rc))
+        log("avahi-daemon restarted hostname_changed={} rc={}".format(hostname_changed, rc))
+    sync_avahi_publish(cfg)
 
 
 def sync_avahi_hostname(device_id):
