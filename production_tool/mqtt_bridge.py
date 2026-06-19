@@ -160,7 +160,8 @@ def measurement_summary(m):
             "current_r_a", "current_t_a",
             "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
             "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
-            "operation_status", "fault_status", "meter_date", "meter_time")
+            "operation_status", "fault_status", "meter_date", "meter_time",
+            "installation_place", "maker_code", "serial_number")
     result = {}
     for key in keys:
         if key in m:
@@ -440,7 +441,7 @@ def wisun_connect(fd, br_id, br_pwd):
 # ---------------------------------------------------------------------------
 
 DEFAULT_EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
-EXTRA_EPCS = [0x80, 0x82, 0x88, 0x97, 0x98, 0xD0, 0xD7, 0xEA, 0xEB]
+EXTRA_EPCS = [0x80, 0x81, 0x82, 0x88, 0x8A, 0x8D, 0x97, 0x98, 0xD0, 0xD7, 0xEA, 0xEB]
 PROPERTY_MAP_EPC = 0x9F
 MISSING_CUMULATIVE_ENERGY = 0xFFFFFFFE
 
@@ -511,6 +512,28 @@ def decode_datetime7(edt):
 def format_datetime(dt):
     return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
 
+INSTALLATION_ROOMS = {
+    0b00001000: "living_room", 0b00010000: "dining_room", 0b00011000: "kitchen",
+    0b00100000: "bathroom",    0b00101000: "toilet",       0b00110000: "washroom",
+    0b00111000: "hallway",     0b01000000: "room",         0b01001000: "stairs",
+    0b01010000: "entrance",    0b01011000: "closet",       0b01100000: "garden",
+    0b01101000: "garage",      0b01110000: "veranda",      0b01111000: "other",
+}
+
+def decode_installation_place(val):
+    if val == 0x00:
+        return "not_set"
+    if val == 0xFF:
+        return "undefined"
+    if val == 0x01:
+        return "location_defined"
+    if 0x02 <= val <= 0x07:
+        return "reserved"
+    if 0x80 <= val <= 0xFE:
+        return "free_definition({:02X})".format(val)
+    room = INSTALLATION_ROOMS.get(val & 0b11111000, "unknown")
+    return "{}({})".format(room, val & 0b00000111)
+
 def decode_measurements(props):
     result = {}
 
@@ -523,6 +546,10 @@ def decode_measurements(props):
             result["operation_status"] = "off"
         else:
             result["operation_status"] = "unknown"
+
+    # 81: installation place
+    if 0x81 in props and len(props[0x81]) >= 1:
+        result["installation_place"] = decode_installation_place(props[0x81][0])
 
     # 82: standard version information
     if 0x82 in props and len(props[0x82]) >= 4:
@@ -543,6 +570,14 @@ def decode_measurements(props):
             result["fault_status"] = "normal"
         else:
             result["fault_status"] = "unknown"
+
+    # 8A: maker code (3-byte vendor code)
+    if 0x8A in props and len(props[0x8A]) >= 1:
+        result["maker_code"] = binascii.hexlify(bytes(props[0x8A])).decode("ascii").upper()
+
+    # 8D: serial number (ASCII)
+    if 0x8D in props and len(props[0x8D]) >= 1:
+        result["serial_number"] = bytes(props[0x8D]).decode("ascii", "replace").strip().replace("\x00", "")
 
     # 97: current time setting
     if 0x97 in props and len(props[0x97]) >= 2:
@@ -642,7 +677,7 @@ def send_el_get(fd, ipv6, tid, epcs=None):
 # properties), instead of an error for the dropped ones - so requests must
 # be split into smaller batches rather than sent as one combined Get.
 EPC_RESPONSE_BYTES = {
-    0x80: 1, 0x82: 4, 0x88: 1, 0x97: 2, 0x98: 4,
+    0x80: 1, 0x81: 1, 0x82: 4, 0x88: 1, 0x8A: 3, 0x8D: 12, 0x97: 2, 0x98: 4,
     0xD0: 15, 0xD3: 4, 0xD7: 1, 0xE0: 4, 0xE1: 1, 0xE2: 4,
     0xE3: 4, 0xE4: 4, 0xE5: 4, 0xE7: 4, 0xE8: 4, 0xEA: 11, 0xEB: 11,
 }
@@ -991,6 +1026,9 @@ SENSOR_DEFS = [
     ("one_minute_timestamp",          "One Minute Timestamp",      None,  None,      None),
     ("fixed_time_forward_timestamp",  "Fixed Time Fwd Timestamp",  None,  None,      None),
     ("fixed_time_reverse_timestamp",  "Fixed Time Rev Timestamp",  None,  None,      None),
+    ("installation_place",            "Installation Place",        None,  None,      None),
+    ("maker_code",                    "Maker Code",                None,  None,      None),
+    ("serial_number",                 "Serial Number",             None,  None,      None),
 ]
 
 def publish_ha_discovery(mqtt, device_id):
@@ -1042,7 +1080,8 @@ def publish_measurements(mqtt, device_id, m):
         mqtt.publish("{}/effective_digits".format(base), str(m["effective_digits"]))
     for key in ("operation_status", "fault_status", "standard_version", "meter_date",
                 "meter_time", "one_minute_timestamp", "fixed_time_forward_timestamp",
-                "fixed_time_reverse_timestamp"):
+                "fixed_time_reverse_timestamp", "installation_place", "maker_code",
+                "serial_number"):
         if key in m and m[key] is not None:
             mqtt.publish("{}/{}".format(base, key), str(m[key]))
 
