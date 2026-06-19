@@ -214,7 +214,24 @@ def has_ota_backup():
     return all(os.path.isfile(target + ".bak") for target in OTA_ALLOWED_TARGETS)
 
 
-def get_wifi_ssid():
+def format_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "{:.1f} {}".format(n, unit) if unit != "B" else "{} {}".format(n, unit)
+        n /= 1024.0
+
+
+def get_disk_free(path):
+    try:
+        st = os.statvfs(path)
+        free = st.f_bavail * st.f_frsize
+        total = st.f_blocks * st.f_frsize
+        return "{} free of {}".format(format_bytes(free), format_bytes(total))
+    except Exception:
+        return ""
+
+
+def get_wifi_status():
     # wpa_cli creates a reply socket using the caller's umask; under the
     # service's default (restrictive) umask, wpa_supplicant (running as a
     # different user) can't connect back to deliver the reply and the
@@ -224,18 +241,23 @@ def get_wifi_ssid():
     try:
         os.system("wpa_cli -p /data/misc/wifi/sockets -i wlan0 status > {} 2>&1".format(shell_quote(tmp_path)))
     except Exception:
-        return ""
+        return {}
     finally:
         os.umask(old_umask)
+    result = {}
     try:
         with open(tmp_path) as f:
             output = f.read()
         for line in output.splitlines():
             if line.startswith("ssid="):
-                return line[len("ssid="):].strip()
+                result["ssid"] = line[len("ssid="):].strip()
+            elif line.startswith("ip_address="):
+                result["ip_address"] = line[len("ip_address="):].strip()
+            elif line.startswith("address="):
+                result["mac_address"] = line[len("address="):].strip()
     except Exception:
         pass
-    return ""
+    return result
 
 
 def tail_log_file(path, max_bytes=8192):
@@ -757,6 +779,18 @@ class ConfigHandler(BaseHTTPRequestHandler):
             reboot_device()
             self._send(200, self._render_form(message="Reboot requested. The device will restart in a few seconds.", active_section=active_section))
             return
+        if self.path == "/wisun/rescan":
+            if not self._require_auth():
+                return
+            params = parse_post_params(self)
+            active_section = normalize_section_name(params.get("next_section", ["maintenance"])[0], "maintenance")
+            restart_bridge()
+            self._send(200, self._render_form(
+                message="Wi-SUN rescan requested. The MQTT bridge is restarting and will rejoin the meter; "
+                        "this takes about 30-60 seconds (scan retries can extend it), during which "
+                        "measurements stop. Check the Status panel afterwards for the new Channel/PAN ID/LQI.",
+                active_section=active_section))
+            return
 
         if self.path != "/save":
             self._send(404, "Not found\n", "text/plain; charset=utf-8")
@@ -1034,6 +1068,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <h2>Maintenance</h2>
 {ota}
 {config_tools}
+<form method="post" action="/wisun/rescan#maintenance" onsubmit="return confirm('Restart the MQTT bridge and rescan for the meter now? This takes about 30-60 seconds and measurements will stop until it rejoins.');">
+<input type="hidden" name="next_section" value="maintenance">
+<div class="actions">
+<button type="submit" class="secondary">Rescan Wi-SUN</button>
+</div>
+<p class="muted">Restarts the bridge to re-scan and rejoin the meter, refreshing Channel/PAN ID/LQI on the Status panel. Takes about 30-60 seconds (longer if scan retries are needed); measurements pause during that time. Useful for comparing signal quality at different install locations.</p>
+</form>
 <form method="post" action="/reboot#maintenance" onsubmit="return confirm('Reboot the device now?');">
 <input type="hidden" name="next_section" value="maintenance">
 <div class="actions">
@@ -1311,10 +1352,15 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if not missing_config:
             missing_config = "-"
 
-        wifi_ssid = get_wifi_ssid() or "-"
+        wifi_status = get_wifi_status()
+        wifi_ssid = wifi_status.get("ssid") or "-"
+        ip_address = wifi_status.get("ip_address") or "-"
+        mac_address = wifi_status.get("mac_address") or "-"
         device_id = cfg.get("device_id", status.get("device_id", "cubej1"))
         web_port = cfg.get("web_port", 8080)
         discovery = "_cubej1-mqtt._tcp / {}.local:{}".format(sanitize_hostname(device_id), web_port)
+        poll_interval = cfg.get("poll_interval", status.get("poll_interval", 60))
+        disk_free = get_disk_free("/data") or "-"
 
         return """<section class="panel" data-section="status">
 <h2>Status</h2>
@@ -1322,11 +1368,18 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>Configuration</span><strong class="pill {config_class}">{config_state}</strong></div>
 <div class="item"><span>Missing config</span><strong>{missing_config}</strong></div>
 <div class="item"><span>Wi-Fi SSID</span><strong>{wifi_ssid}</strong></div>
+<div class="item"><span>IP Address</span><strong>{ip_address}</strong></div>
+<div class="item"><span>MAC Address</span><strong>{mac_address}</strong></div>
 <div class="item"><span>MQTT</span>{mqtt}</div>
 <div class="item"><span>Wi-SUN</span>{wisun}</div>
+<div class="item"><span>Wi-SUN Channel</span><strong>{wisun_channel}</strong></div>
+<div class="item"><span>Wi-SUN PAN ID</span><strong>{wisun_pan_id}</strong></div>
+<div class="item"><span>Wi-SUN LQI</span><strong>{wisun_lqi}</strong></div>
 <div class="item"><span>Device ID</span><strong>{device_id}</strong></div>
 <div class="item"><span>Discovery</span><strong>{discovery}</strong></div>
 <div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
+<div class="item"><span>Poll interval</span><strong>{poll_interval}s</strong></div>
+<div class="item"><span>Disk free (/data)</span><strong>{disk_free}</strong></div>
 <div class="item"><span>Bridge started</span><strong>{started}</strong></div>
 <div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
 <div class="item"><span>Updated</span><strong>{updated}</strong></div>
@@ -1337,11 +1390,18 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <p><a href="/status.json">status.json</a></p>
 </section>""".format(
             wifi_ssid=html_escape(wifi_ssid),
+            ip_address=html_escape(ip_address),
+            mac_address=html_escape(mac_address),
             mqtt=self._bool_status(status.get("mqtt_connected")),
             wisun=self._bool_status(status.get("wisun_connected")),
+            wisun_channel=self._status_value(status, "wisun_channel"),
+            wisun_pan_id=self._status_value(status, "wisun_pan_id"),
+            wisun_lqi=self._status_value(status, "wisun_lqi"),
             device_id=self._status_value(status, "device_id"),
             discovery=html_escape(discovery),
             meter_ipv6=self._status_value(status, "meter_ipv6"),
+            poll_interval=html_escape(poll_interval),
+            disk_free=html_escape(disk_free),
             started=self._status_value(status, "bridge_started_at"),
             last_measurement=self._status_value(status, "last_measurement_at"),
             updated=self._status_value(status, "updated_at"),
