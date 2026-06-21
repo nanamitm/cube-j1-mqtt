@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Resolve version
         id: version
@@ -40,13 +40,13 @@ jobs:
             --output dist/cube-j1-mqtt-update.zip
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cube-j1-mqtt-update
           path: dist/cube-j1-mqtt-update.zip
 
       - name: Upload release asset
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/cube-j1-mqtt-update.zip
