@@ -37,10 +37,12 @@ done
 cp $PT/config.json       /data/local/config.json
 cp $PT/mqtt_bridge.py    /data/local/mqtt_bridge.py
 cp $PT/config_server.py  /data/local/config_server.py
+cp $PT/disable_p2p_ap.sh /data/local/disable_p2p_ap.sh
 cp $PT/VERSION           /data/local/cube-j1-mqtt.version
 chmod 600 /data/local/config.json
 chmod 755 /data/local/mqtt_bridge.py
 chmod 755 /data/local/config_server.py
+chmod 755 /data/local/disable_p2p_ap.sh
 chmod 644 /data/local/cube-j1-mqtt.version
 
 # make root filesystem writable so we can update init RC files
@@ -58,10 +60,17 @@ cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
 # install config web UI as an init service
 cp $PT/config_server.rc /system/etc/init/cubej_web_ui.rc
 
+# install P2P/AP disabler as an init service (auto-runs on every boot,
+# the factory CubeJ-xxxxxx AP has no usable credentials - see disable_p2p_ap.sh)
+cp $PT/disable_p2p_ap.rc /system/etc/init/disable_p2p_ap.rc
+
 # ── Stop conflicting services immediately ──────────────────────────────────────
 stop wisund
 stop NDEcLiteAgent
 sleep 2
+
+# ── Stop the factory P2P/AP now (init service handles future boots) ───────────
+/system/bin/sh /data/local/disable_p2p_ap.sh
 
 # ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───
 stop mqtt_ha_bridge 2>/dev/null || true

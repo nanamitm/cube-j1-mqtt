@@ -1,0 +1,6 @@
+service disable_p2p_ap /system/bin/sh /data/local/disable_p2p_ap.sh
+    class late_start
+    user root
+    group root
+    oneshot
+    seclabel u:r:shell:s0
