@@ -95,6 +95,7 @@ Web UI本体（HTML）。Androidクライアントからは通常不要。
 | `poll_interval` | ポーリング間隔（秒） | 数値、1以上 |
 | `web_port` | Web UIのポート | 数値、1〜65535。**80は不可**（本体nginxと衝突） |
 | `web_user` / `web_pass` | Web UI Basic認証情報 | `web_user`は空不可 |
+| `log_max_bytes` | `mqtt_bridge.log`/`serial.log`のローテーションしきい値（バイト） | 数値、65536（64KB）以上 |
 | `restart_bridge` | `"1"`を送るとMQTTブリッジを再起動 | 任意 |
 
 挙動:
@@ -150,7 +151,8 @@ OTAパッケージ（zip）を適用する。Content-Type: `multipart/form-data`
     "poll_interval": 60,
     "web_port": 8080,
     "web_user": "admin",
-    "web_pass": "cubej1"
+    "web_pass": "cubej1",
+    "log_max_bytes": 10485760
 }
 ```
 

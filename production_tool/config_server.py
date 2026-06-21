@@ -75,6 +75,7 @@ DEFAULTS = collections.OrderedDict([
     ("web_port", 8080),
     ("web_user", "admin"),
     ("web_pass", "cubej1"),
+    ("log_max_bytes", 10 * 1024 * 1024),
 ])
 
 FIELDS = [
@@ -90,9 +91,10 @@ FIELDS = [
     ("web_port", "Web Port", "number"),
     ("web_user", "Web User", "text"),
     ("web_pass", "Web Password", "password"),
+    ("log_max_bytes", "Log Max Size (bytes)", "number"),
 ]
 
-INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port"])
+INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port", "log_max_bytes"])
 SECTION_NAMES = ["status", "measurements", "config", "maintenance", "logs"]
 
 
@@ -162,6 +164,8 @@ def validate_config_values(cfg):
         errors.append("poll_interval must be 30 seconds or more (Wi-SUN duty cycle limit)")
     if not str(cfg.get("web_user", "")):
         errors.append("web_user must not be empty")
+    if cfg.get("log_max_bytes", 0) < 65536:
+        errors.append("log_max_bytes must be at least 65536 (64KB)")
     return errors
 
 
@@ -1186,7 +1190,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         groups = [
             ("B-route", ["br_id", "br_pwd"]),
             ("MQTT", ["mqtt_host", "mqtt_port", "mqtt_user", "mqtt_pass"]),
-            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass"]),
+            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes"]),
         ]
 
         sections = []

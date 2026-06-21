@@ -28,6 +28,11 @@ SERIAL_LOG_PATH = "/data/local/serial.log"
 STATUS_PATH = "/data/local/mqtt_status.json"
 OTA_STATUS_PATH = "/data/local/ota_status.json"
 
+# Log files rotate to ".1" once they reach this size (config.json's
+# log_max_bytes overrides this); the previous ".1" is dropped, so each log's
+# on-disk footprint is bounded to roughly 2x this value.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+
 LED_R = "/sys/class/leds/red/brightness"
 LED_G = "/sys/class/leds/green/brightness"
 LED_B = "/sys/class/leds/blue/brightness"
@@ -54,10 +59,35 @@ _log_file = None
 _serial_log_file = None
 _status = {}
 
+def _rotate_if_needed(file_obj, path):
+    """Roll path over to path+'.1' once it reaches LOG_MAX_BYTES.
+
+    Returns the file object to keep using (a freshly opened one if
+    rotation happened, or the original/None on failure).
+    """
+    if not file_obj:
+        return file_obj
+    try:
+        if os.fstat(file_obj.fileno()).st_size < LOG_MAX_BYTES:
+            return file_obj
+        file_obj.close()
+        backup_path = path + ".1"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.rename(path, backup_path)
+        return open(path, "a")
+    except Exception:
+        try:
+            return open(path, "a")
+        except Exception:
+            return None
+
 def log(msg):
     ts = now_str()
     line = "[{}] {}\n".format(ts, msg)
     global _log_file
+    if _log_file:
+        _log_file = _rotate_if_needed(_log_file, LOG_PATH)
     if _log_file:
         try:
             _log_file.write(line)
@@ -69,6 +99,10 @@ def log(msg):
         sys.stderr.flush()
 
 def serial_log(direction, data):
+    global _serial_log_file
+    if not _serial_log_file:
+        return
+    _serial_log_file = _rotate_if_needed(_serial_log_file, SERIAL_LOG_PATH)
     if not _serial_log_file:
         return
     if isinstance(data, bytes):
@@ -837,12 +871,16 @@ def _encode_str(s):
 MQTT_OUT_QUEUE_MAX = 200
 
 class MQTTClient(object):
-    def __init__(self, host, port, client_id, username=None, password=None):
+    def __init__(self, host, port, client_id, username=None, password=None,
+                 will_topic=None, will_payload=None, will_retain=False):
         self.host      = host
         self.port      = port
         self.client_id = client_id
         self.username  = username
         self.password  = password
+        self.will_topic   = will_topic
+        self.will_payload = will_payload
+        self.will_retain  = will_retain
         self.sock      = None
         self._out_queue = collections.deque()
 
@@ -908,13 +946,22 @@ class MQTTClient(object):
         flags = 0x02  # clean session
         if self.username: flags |= 0x80
         if self.password: flags |= 0x40
+        if self.will_topic:
+            flags |= 0x04
+            if self.will_retain:
+                flags |= 0x20
 
         var_hdr = (b"\x00\x04MQTT"
                    + b"\x04"
                    + struct.pack("B", flags)
                    + b"\x00\x3C")   # keep-alive 60s
 
+        # Payload order per MQTT 3.1.1 spec: client id, then will
+        # topic/message (if the will flag is set), then user/password.
         payload = _encode_str(self.client_id)
+        if self.will_topic:
+            payload += _encode_str(self.will_topic)
+            payload += _encode_str(self.will_payload or "")
         if self.username: payload += _encode_str(self.username)
         if self.password: payload += _encode_str(self.password)
 
@@ -944,6 +991,13 @@ class MQTTClient(object):
                      mqtt_host=self.host,
                      mqtt_port=self.port,
                      last_error="")
+
+        # Republish "online" on every (re)connect - the broker only sends
+        # our will message ("offline") on an ungraceful disconnect, so the
+        # retained availability topic must be refreshed back to "online"
+        # each time we successfully reconnect.
+        if self.will_topic:
+            self.publish(self.will_topic, "online", retain=True)
 
         # flush any queued messages
         try:
@@ -1039,12 +1093,16 @@ def publish_ha_discovery(mqtt, device_id):
         "manufacturer": "NextDrive",
     }
     base = "cubej/{}".format(device_id)
+    availability_topic = "{}/status".format(base)
     for sid, name, unit, dev_class, state_class in SENSOR_DEFS:
         topic  = "homeassistant/sensor/{}/{}/config".format(device_id, sid)
         config = {
             "name":               name,
             "unique_id":          "{}_{}".format(device_id, sid),
             "state_topic":        "{}/{}".format(base, sid),
+            "availability_topic": availability_topic,
+            "payload_available":  "online",
+            "payload_not_available": "offline",
             "device":             device,
         }
         if unit:
@@ -1105,7 +1163,7 @@ def publish_bridge_status(mqtt, device_id):
 # ---------------------------------------------------------------------------
 
 def main():
-    global _log_file, _serial_log_file
+    global _log_file, _serial_log_file, LOG_MAX_BYTES
     try:
         _log_file = open(LOG_PATH, "a")
     except Exception:
@@ -1122,6 +1180,7 @@ def main():
                  last_error="Loading configuration")
 
     cfg           = wait_for_config()
+    LOG_MAX_BYTES = int(cfg.get("log_max_bytes", LOG_MAX_BYTES))
     br_id         = cfg["br_id"]
     br_pwd        = cfg["br_pwd"]
     ha_host       = cfg["mqtt_host"]
@@ -1153,9 +1212,13 @@ def main():
                  last_values={},
                  last_error="")
 
-    # Connect MQTT in the background; Wi-SUN setup below must not wait on it
+    # Connect MQTT in the background; Wi-SUN setup below must not wait on it.
+    # A will (LWT) is registered so Home Assistant marks entities
+    # "unavailable" if the bridge disappears without a clean disconnect.
+    status_topic = "cubej/{}/status".format(device_id)
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
-                      username=ha_user, password=ha_pass)
+                      username=ha_user, password=ha_pass,
+                      will_topic=status_topic, will_payload="offline", will_retain=True)
     mqtt.start()
 
     publish_ha_discovery(mqtt, device_id)
