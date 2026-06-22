@@ -57,9 +57,22 @@ AVAHI_DBUS_SYSTEM_BUS_ADDRESS = "unix:path=/dev/socket/dbus"
 MAX_OTA_PACKAGE_SIZE = 2 * 1024 * 1024
 MAX_CONFIG_IMPORT_SIZE = 64 * 1024
 
+# Each target's apply action is fixed here in code, not read from the
+# package's manifest - letting a manifest dictate what gets restarted
+# would turn that field into an arbitrary-command injection point.
 OTA_ALLOWED_TARGETS = {
-    "/data/local/mqtt_bridge.py": "mqtt_bridge.py",
-    "/data/local/config_server.py": "config_server.py",
+    "/data/local/mqtt_bridge.py": {
+        "rel_path": "mqtt_bridge.py",
+        "restart_service": "mqtt_ha_bridge",
+    },
+    "/data/local/config_server.py": {
+        "rel_path": "config_server.py",
+        "restart_service": "cubej_web_ui",
+    },
+    "/data/local/disable_p2p_ap.sh": {
+        "rel_path": "disable_p2p_ap.sh",
+        "restart_service": "disable_p2p_ap",
+    },
 }
 
 DEFAULTS = collections.OrderedDict([
@@ -76,6 +89,7 @@ DEFAULTS = collections.OrderedDict([
     ("web_user", "admin"),
     ("web_pass", "cubej1"),
     ("log_max_bytes", 10 * 1024 * 1024),
+    ("adb_enabled", True),
 ])
 
 FIELDS = [
@@ -92,9 +106,11 @@ FIELDS = [
     ("web_user", "Web User", "text"),
     ("web_pass", "Web Password", "password"),
     ("log_max_bytes", "Log Max Size (bytes)", "number"),
+    ("adb_enabled", "ADB over network (port 5555)", "checkbox"),
 ]
 
 INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port", "log_max_bytes"])
+BOOL_FIELDS = set(["adb_enabled"])
 SECTION_NAMES = ["status", "measurements", "config", "maintenance", "logs"]
 
 
@@ -129,7 +145,24 @@ def load_status():
         ])
 
 
+def is_locked_mode():
+    # Deliberately not in DEFAULTS/FIELDS: this reads the on-disk file
+    # directly so locked_mode can only ever be set by the one-time USB
+    # installer, never via /save or /config/import.
+    try:
+        with open(CONFIG_PATH) as f:
+            raw = json.load(f)
+        return bool(raw.get("locked_mode", False))
+    except Exception:
+        return False
+
+
 def save_config(cfg):
+    # Force locked_mode to whatever is already on disk, regardless of what
+    # the caller's cfg has - it must not be changeable through any Web UI
+    # write path (see is_locked_mode()).
+    cfg = collections.OrderedDict(cfg)
+    cfg["locked_mode"] = is_locked_mode()
     directory = os.path.dirname(CONFIG_PATH)
     fd, tmp_path = tempfile.mkstemp(prefix=".config.", suffix=".json", dir=directory)
     try:
@@ -166,6 +199,8 @@ def validate_config_values(cfg):
         errors.append("web_user must not be empty")
     if cfg.get("log_max_bytes", 0) < 65536:
         errors.append("log_max_bytes must be at least 65536 (64KB)")
+    for key in BOOL_FIELDS:
+        cfg[key] = cfg.get(key) in ("1", "true", "True", True)
     return errors
 
 
@@ -220,7 +255,11 @@ def load_current_version():
 
 
 def has_ota_backup():
-    return all(os.path.isfile(target + ".bak") for target in OTA_ALLOWED_TARGETS)
+    # any(), not all(): not every OTA package necessarily touches every
+    # allowed target, so requiring every target to have a backup would
+    # make rollback permanently unavailable once a target-specific package
+    # (e.g. disable_p2p_ap.sh alone) is applied.
+    return any(os.path.isfile(target + ".bak") for target in OTA_ALLOWED_TARGETS)
 
 
 def format_bytes(n):
@@ -352,7 +391,7 @@ def validate_ota_package(package_path):
 
             if install_to not in OTA_ALLOWED_TARGETS:
                 raise ValueError("Install target is not allowed: {}".format(install_to))
-            if OTA_ALLOWED_TARGETS[install_to] != rel_path:
+            if OTA_ALLOWED_TARGETS[install_to]["rel_path"] != rel_path:
                 raise ValueError("Path does not match install target: {}".format(rel_path))
             if rel_path not in names:
                 raise ValueError("Package file is missing: {}".format(rel_path))
@@ -409,8 +448,26 @@ def shell_status_heredoc(state, message, version):
     ]
 
 
+def ota_restart_services(install_to_list):
+    """Split the restart_service for each install_to into (immediate, deferred).
+
+    cubej_web_ui (this process's own service) is always deferred to the end
+    of the apply/rollback script, after the success status is written, so
+    the page that triggered the request stays reachable for as long as
+    possible. Everything else restarts inline as files are swapped.
+    """
+    services = set(OTA_ALLOWED_TARGETS[t]["restart_service"]
+                   for t in install_to_list if t in OTA_ALLOWED_TARGETS)
+    immediate = sorted(s for s in services if s != "cubej_web_ui")
+    deferred = sorted(s for s in services if s == "cubej_web_ui")
+    return immediate, deferred
+
+
 def start_ota_apply(manifest):
     version = str(manifest.get("version", ""))
+    targets = [str(item.get("install_to")) for item in manifest.get("files", [])]
+    immediate_services, deferred_services = ota_restart_services(targets)
+
     lines = [
         "#!/system/bin/sh",
         "LOG={}".format(shell_quote(OTA_LOG_PATH)),
@@ -431,16 +488,16 @@ def start_ota_apply(manifest):
         "  cat > $STATUS <<JSON",
         "{\"state\":\"rolled_back\",\"message\":\"OTA apply failed and rollback was attempted: $MSG\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + version + "\"}",
         "JSON",
-        "  start mqtt_ha_bridge >/dev/null 2>&1",
+    ]
+    lines.extend("  start {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
+    lines.extend([
         "  exit 1",
         "}",
         "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply start version={}\" >> $LOG".format(version),
-    ]
-    lines.extend(shell_status_heredoc("applying", "Applying OTA update", version))
-    lines.extend([
-        "stop mqtt_ha_bridge >/dev/null 2>&1",
-        "sleep 1",
     ])
+    lines.extend(shell_status_heredoc("applying", "Applying OTA update", version))
+    lines.extend("stop {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
+    lines.append("sleep 1")
 
     for item in manifest.get("files", []):
         rel_path = str(item.get("path"))
@@ -460,15 +517,16 @@ def start_ota_apply(manifest):
         "cp {} {} 2>/dev/null".format(shell_quote(OTA_VERSION_PATH), shell_quote(OTA_VERSION_PATH + ".bak")),
         "echo {} > {} || fail {}".format(shell_quote(version), shell_quote(OTA_VERSION_PATH), shell_quote("write version")),
         "/usr/bin/python /data/local/config_server.py --sync-avahi >> $LOG 2>&1 || fail {}".format(shell_quote("sync avahi")),
-        "start mqtt_ha_bridge >/dev/null 2>&1",
     ])
+    lines.extend("start {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
     lines.extend(shell_status_heredoc("success", "OTA update applied; services restarted", version))
-    lines.extend([
-        "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply success version={}\" >> $LOG".format(version),
-        "stop cubej_web_ui >/dev/null 2>&1",
-        "sleep 1",
-        "start cubej_web_ui >/dev/null 2>&1",
-    ])
+    lines.append("echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] apply success version={}\" >> $LOG".format(version))
+    for svc in deferred_services:
+        lines.extend([
+            "stop {} >/dev/null 2>&1".format(svc),
+            "sleep 1",
+            "start {} >/dev/null 2>&1".format(svc),
+        ])
 
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -477,6 +535,9 @@ def start_ota_apply(manifest):
 
 
 def start_ota_rollback():
+    backed_up_targets = sorted(t for t in OTA_ALLOWED_TARGETS if os.path.isfile(t + ".bak"))
+    immediate_services, deferred_services = ota_restart_services(backed_up_targets)
+
     lines = [
         "#!/system/bin/sh",
         "LOG={}".format(shell_quote(OTA_LOG_PATH)),
@@ -487,17 +548,19 @@ def start_ota_rollback():
         "  cat > $STATUS <<JSON",
         "{\"state\":\"failed\",\"message\":\"Manual rollback failed: $MSG\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"" + load_current_version() + "\"}",
         "JSON",
-        "  start mqtt_ha_bridge >/dev/null 2>&1",
+    ]
+    lines.extend("  start {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
+    lines.extend([
         "  exit 1",
         "}",
         "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] manual rollback start\" >> $LOG",
         "cat > $STATUS <<'JSON'",
         make_status_json("applying", "Rolling back to previous OTA backup", load_current_version()),
         "JSON",
-        "stop mqtt_ha_bridge >/dev/null 2>&1",
-        "sleep 1",
-    ]
-    for install_to in sorted(OTA_ALLOWED_TARGETS.keys()):
+    ])
+    lines.extend("stop {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
+    lines.append("sleep 1")
+    for install_to in backed_up_targets:
         lines.extend([
             "if [ -f {} ]; then".format(shell_quote(install_to + ".bak")),
             "  cp {} {} || fail {}".format(shell_quote(install_to + ".bak"), shell_quote(install_to), shell_quote("restore " + install_to)),
@@ -511,15 +574,20 @@ def start_ota_rollback():
             shell_quote(OTA_VERSION_PATH)),
         "ROLLED_BACK_VERSION=$(cat {} 2>/dev/null)".format(shell_quote(OTA_VERSION_PATH)),
         "/usr/bin/python /data/local/config_server.py --sync-avahi >> $LOG 2>&1 || fail {}".format(shell_quote("sync avahi")),
-        "start mqtt_ha_bridge >/dev/null 2>&1",
+    ])
+    lines.extend("start {} >/dev/null 2>&1".format(svc) for svc in immediate_services)
+    lines.extend([
         "cat > $STATUS <<JSON",
         "{\"state\":\"rolled_back\",\"message\":\"Manual rollback applied; services restarted\",\"updated_at\":\"$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')\",\"version\":\"$ROLLED_BACK_VERSION\"}",
         "JSON",
         "echo \"[$(TZ=JST-9 date '+%Y-%m-%d %H:%M:%S')] manual rollback success\" >> $LOG",
-        "stop cubej_web_ui >/dev/null 2>&1",
-        "sleep 1",
-        "start cubej_web_ui >/dev/null 2>&1",
     ])
+    for svc in deferred_services:
+        lines.extend([
+            "stop {} >/dev/null 2>&1".format(svc),
+            "sleep 1",
+            "start {} >/dev/null 2>&1".format(svc),
+        ])
     with open(OTA_APPLY_SCRIPT, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(OTA_APPLY_SCRIPT, 0o755)
@@ -563,6 +631,19 @@ def restart_bridge():
 def reboot_device():
     rc = os.system("(sleep 1; reboot) >/dev/null 2>&1 &")
     log("reboot_device rc={}".format(rc))
+
+
+def apply_adb_setting(enabled):
+    # Only toggles ADB-over-network (TCP port 5555). persist.sys.usb.config
+    # (USB-cable ADB) is left alone on purpose - this device is meant to run
+    # on a trusted LAN, and ADB itself needs no further hardening there (see
+    # readme); this toggle exists so the network-reachable port can be
+    # closed when the user wants to, not because it's on by default.
+    port = "5555" if enabled else "-1"
+    rc = os.system(
+        "setprop service.adb.tcp.port {p}; setprop persist.adb.tcp.port {p}; "
+        "stop adbd >/dev/null 2>&1; sleep 1; start adbd >/dev/null 2>&1".format(p=port))
+    log("apply_adb_setting enabled={} rc={}".format(enabled, rc))
 
 
 def sanitize_hostname(value):
@@ -729,6 +810,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _reject_locked(self):
+        if is_locked_mode():
+            self._send(403, "Disabled by locked_mode\n", "text/plain; charset=utf-8")
+            return True
+        return False
+
     def do_GET(self):
         if self.path == "/status.json":
             if not self._require_auth():
@@ -745,6 +832,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if self.path == "/config.json":
             if not self._require_auth():
                 return
+            if self._reject_locked():
+                return
             self._send(200, json.dumps(load_config(), indent=2) + "\n",
                        "application/json; charset=utf-8")
             return
@@ -756,6 +845,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/serial.log":
             if not self._require_auth():
+                return
+            if self._reject_locked():
                 return
             self._send(200, tail_log_file(SERIAL_LOG_PATH, 262144) or "No log yet\n",
                        "text/plain; charset=utf-8")
@@ -771,10 +862,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if self.path == "/ota/upload":
             if not self._require_auth():
                 return
+            if self._reject_locked():
+                return
             self._handle_ota_upload()
             return
         if self.path == "/ota/rollback":
             if not self._require_auth():
+                return
+            if self._reject_locked():
                 return
             params = parse_post_params(self)
             active_section = normalize_section_name(params.get("next_section", ["maintenance"])[0], "maintenance")
@@ -786,6 +881,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/config/import":
             if not self._require_auth():
+                return
+            if self._reject_locked():
                 return
             self._handle_config_import()
             return
@@ -815,10 +912,13 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if not self._require_auth():
             return
+        if self._reject_locked():
+            return
 
         params = parse_post_params(self)
         active_section = normalize_section_name(params.get("next_section", ["config"])[0], "config")
         cfg = load_config()
+        old_adb_enabled = cfg.get("adb_enabled", DEFAULTS.get("adb_enabled"))
 
         errors = []
         for key, _, _ in FIELDS:
@@ -834,6 +934,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             save_config(cfg)
             self.server.config = cfg
             sync_avahi(cfg)
+            if cfg.get("adb_enabled") != old_adb_enabled:
+                apply_adb_setting(cfg.get("adb_enabled"))
             if params.get("restart_bridge", [""])[0] == "1":
                 restart_bridge()
             self._send(200, self._render_form(message="Saved", active_section=active_section))
@@ -888,6 +990,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             if not isinstance(raw, str):
                 raw = raw.decode("utf-8")
 
+            old_adb_enabled = load_config().get("adb_enabled", DEFAULTS.get("adb_enabled"))
+
             loaded = json.loads(raw, object_pairs_hook=collections.OrderedDict)
             cfg = collections.OrderedDict(DEFAULTS)
             for key, val in loaded.items():
@@ -902,6 +1006,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
             save_config(cfg)
             self.server.config = cfg
             sync_avahi(cfg)
+            if cfg.get("adb_enabled") != old_adb_enabled:
+                apply_adb_setting(cfg.get("adb_enabled"))
             restart_bridge()
             self._send(200, self._render_form(message="Config imported", active_section=active_section))
         except Exception as e:
@@ -1186,11 +1292,17 @@ summary {{ cursor: pointer; font-weight: 600; }}
            initial_section=html_escape(active_section))
 
     def _render_config_form(self, cfg):
+        if cfg.get("locked_mode"):
+            return ('<section class="panel" data-section="config">'
+                    '<h2>Config</h2>'
+                    '<p class="muted">Configuration viewing/editing is disabled by locked_mode. '
+                    'Re-run the USB installer with locked_mode off to change settings.</p>'
+                    '</section>')
         labels = dict([(key, (label, input_type)) for key, label, input_type in FIELDS])
         groups = [
             ("B-route", ["br_id", "br_pwd"]),
             ("MQTT", ["mqtt_host", "mqtt_port", "mqtt_user", "mqtt_pass"]),
-            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes"]),
+            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes", "adb_enabled"]),
         ]
 
         sections = []
@@ -1198,6 +1310,12 @@ summary {{ cursor: pointer; font-weight: 600; }}
             rows = []
             for key in keys:
                 label, input_type = labels[key]
+                if input_type == "checkbox":
+                    checked = " checked" if cfg.get(key, DEFAULTS.get(key)) else ""
+                    rows.append(
+                        '<label><span>{}</span><input name="{}" type="checkbox" value="1"{}></label>'.format(
+                            html_escape(label), html_escape(key), checked))
+                    continue
                 value = html_escape(cfg.get(key, DEFAULTS.get(key, "")))
                 rows.append(
                     '<label><span>{}</span><input name="{}" type="{}" value="{}"></label>'.format(
@@ -1226,6 +1344,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
         return html_escape(value)
 
     def _render_ota_panel(self, ota_status):
+        if is_locked_mode():
+            return ('<div class="fieldset"><h3>OTA Update</h3>'
+                    '<p class="muted">OTA updates are disabled by locked_mode.</p></div>')
         current_version = load_current_version() or "-"
         state = ota_status.get("state", "idle")
         state_class = "ok" if state == "success" else ("bad" if state in ("failed", "rolled_back") else "muted")
@@ -1273,6 +1394,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
             log_html=log_html)
 
     def _render_config_tools(self):
+        if is_locked_mode():
+            return ('<div class="fieldset"><h3>Config Backup</h3>'
+                    '<p class="muted">Config backup/import is disabled by locked_mode.</p></div>')
         return """<div class="fieldset">
 <h3>Config Backup</h3>
 <p><a href="/config.json">Download config.json</a></p>
@@ -1333,10 +1457,19 @@ summary {{ cursor: pointer; font-weight: 600; }}
         if bridge_log:
             bridge_log_html = "<pre>{}</pre>".format(html_escape(bridge_log))
 
-        serial_log = load_serial_log()
-        serial_log_html = '<p class="muted">No serial log yet.</p>'
-        if serial_log:
-            serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
+        if is_locked_mode():
+            serial_section = ("<details><summary>Serial Log /dev/ttyS1</summary>"
+                               '<p class="muted">Disabled by locked_mode '
+                               "(contains the B-route ID/password in plaintext).</p></details>")
+        else:
+            serial_log = load_serial_log()
+            serial_log_html = '<p class="muted">No serial log yet.</p>'
+            if serial_log:
+                serial_log_html = "<pre>{}</pre>".format(html_escape(serial_log))
+            serial_section = ("<details><summary>Serial Log /dev/ttyS1</summary>"
+                               '<div id="serial-log-box">{}</div>'
+                               '<p><a href="/serial.log">serial.log (full)</a></p></details>'
+                               ).format(serial_log_html)
 
         return """<section class="panel" data-section="logs">
 <h2>Logs</h2>
@@ -1345,14 +1478,10 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div id="bridge-log-box">{bridge_log_html}</div>
 <p><a href="/mqtt_bridge.log">mqtt_bridge.log (full)</a></p>
 </details>
-<details>
-<summary>Serial Log /dev/ttyS1</summary>
-<div id="serial-log-box">{serial_log_html}</div>
-<p><a href="/serial.log">serial.log (full)</a></p>
-</details>
+{serial_section}
 </section>""".format(
             bridge_log_html=bridge_log_html,
-            serial_log_html=serial_log_html)
+            serial_section=serial_section)
 
     def _render_status(self, status, cfg):
         gettable = ", ".join(status.get("gettable_epcs") or [])
@@ -1380,6 +1509,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
         poll_interval = cfg.get("poll_interval", status.get("poll_interval", 60))
         disk_free = get_disk_free("/data") or "-"
         last_values = status.get("last_values") or {}
+        locked_class = "bad" if cfg.get("locked_mode") else "muted"
+        locked_state = "locked" if cfg.get("locked_mode") else "off"
 
         return """<section class="panel" data-section="status">
 <h2>Status</h2>
@@ -1412,6 +1543,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>Bridge started</span><strong>{started}</strong></div>
 <div class="item"><span>Updated</span><strong>{updated}</strong></div>
 <div class="item"><span>Last error</span><strong class="{error_class}">{last_error}</strong></div>
+<div class="item"><span>Locked mode</span><strong class="pill {locked_class}">{locked_state}</strong></div>
 </div>
 <p><a href="/status.json">status.json</a></p>
 </section>""".format(
@@ -1440,7 +1572,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
             error_class=error_class,
             last_error=html_escape(last_error),
             polling=html_escape(polling),
-            gettable=html_escape(gettable))
+            gettable=html_escape(gettable),
+            locked_class=locked_class,
+            locked_state=locked_state)
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):

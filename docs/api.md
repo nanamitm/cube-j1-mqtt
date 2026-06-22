@@ -8,6 +8,7 @@
 - **認証**: HTTP Basic認証。全エンドポイント共通（`config.json`の`web_user`/`web_pass`）。未認証時は`401`＋`WWW-Authenticate: Basic realm="Cube J1 MQTT Config"`。
 - **文字コード**: レスポンスは全て`UTF-8`。
 - **重要な注意**: `POST`系エンドポイント（`/save`, `/reboot`, `/ota/upload`, `/ota/rollback`, `/config/import`）は**レスポンスボディがHTML**（Web UIのページ全体を再レンダリングしたもの）です。JSONは返りません。成功/失敗の判定は**HTTPステータスコード**（`200`=成功、`400`/`500`=失敗）で行い、詳細な状態を知りたい場合は直後に`GET /status.json`や`GET /ota_status.json`を呼んでください。
+- **`locked_mode`**: `config.json`の`locked_mode`が`true`の機体では、`GET /config.json`・`GET /serial.log`・`POST /save`・`POST /ota/upload`・`POST /ota/rollback`・`POST /config/import`が認証成功後でも`403`（本文`Disabled by locked_mode`）を返す。`locked_mode`はUSBインストール時にのみ設定可能で、APIからは変更できない。
 
 ## 自動検出（mDNS / DNS-SD）
 
@@ -63,13 +64,13 @@ MQTTブリッジ（`mqtt_bridge.py`）の現在の状態。`mqtt_bridge.py`が`/
 | `version` | string | 適用/ロールバック後のバージョン文字列 |
 
 ### `GET /config.json`
-現在の`config.json`の内容をそのまま返します（`br_pwd`/`mqtt_pass`/`web_pass`等も平文で含まれるので扱いに注意）。フィールドは下記「`config.json`スキーマ」参照。
+現在の`config.json`の内容をそのまま返します（`br_pwd`/`mqtt_pass`/`web_pass`等も平文で含まれるので扱いに注意）。フィールドは下記「`config.json`スキーマ」参照。`locked_mode=true`時は`403`。
 
 ### `GET /mqtt_bridge.log`
-MQTTブリッジの動作ログ（テキスト、`text/plain`）。末尾最大256KB。ログが無い場合は`No log yet`を返す。
+MQTTブリッジの動作ログ（テキスト、`text/plain`）。末尾最大256KB。ログが無い場合は`No log yet`を返す。`locked_mode`の影響を受けない。
 
 ### `GET /serial.log`
-`/dev/ttyS1`との生シリアル通信ログ（テキスト、`text/plain`）。末尾最大256KB。
+`/dev/ttyS1`との生シリアル通信ログ（テキスト、`text/plain`）。末尾最大256KB。Bルートの認証情報（`SKSETPWD`/`SKSETRBID`コマンド）が平文で含まれるため、`locked_mode=true`時は`403`。
 
 ### `GET /` または `GET /index.html`
 Web UI本体（HTML）。Androidクライアントからは通常不要。
@@ -96,13 +97,16 @@ Web UI本体（HTML）。Androidクライアントからは通常不要。
 | `web_port` | Web UIのポート | 数値、1〜65535。**80は不可**（本体nginxと衝突） |
 | `web_user` / `web_pass` | Web UI Basic認証情報 | `web_user`は空不可 |
 | `log_max_bytes` | `mqtt_bridge.log`/`serial.log`のローテーションしきい値（バイト） | 数値、65536（64KB）以上 |
+| `adb_enabled` | ADBのネットワーク経由アクセス（TCP `5555`）の有効/無効 | チェックボックス。チェック時のみ`"1"`が送信され、未送信時は無効として扱われる |
 | `restart_bridge` | `"1"`を送るとMQTTブリッジを再起動 | 任意 |
 
 挙動:
-- 全フィールドを毎回送ること（未送信のフィールドは空文字として扱われ上書きされる）
+- 全フィールドを毎回送ること（未送信のフィールドは空文字として扱われ上書きされる。`adb_enabled`はこの仕様を利用したチェックボックス実装）
 - 検証エラー時は`400`
 - 保存成功時は`200`。`device_id`が変わっていればavahiホスト名を自動同期（変更時のみavahi再起動）
 - `web_port`変更は**ブリッジ自身の再起動が必要**（`POST /reboot`または`adb`での`cubej_web_ui`再起動）
+- `adb_enabled`が前回保存時の値から変化していれば、保存直後に`adbd`を再起動して即座に反映する
+- `locked_mode=true`時は`403`（設定の変更自体ができない）
 
 ### `POST /reboot`
 本体を再起動する（レスポンス送信後1秒待ってバックグラウンドで`reboot`実行）。パラメータ不要。`200`固定。
@@ -116,14 +120,18 @@ OTAパッケージ（zip）を適用する。Content-Type: `multipart/form-data`
 
 挙動:
 - `manifest.json`・SHA-256・対象パス・互換性を検証してから適用
+- 更新対象は`/data/local/mqtt_bridge.py`・`/data/local/config_server.py`・`/data/local/disable_p2p_ap.sh`の3つのみ許可。それぞれ適用後に再起動するサービス（`mqtt_ha_bridge`/`cubej_web_ui`/`disable_p2p_ap`）はサーバー側コードに固定されており、manifestでは指定できない
+- パッケージに含まれるファイルのみが更新され、対応するサービスのみが再起動する（全ファイルを含める必要はない）
 - 受理されると`200`＋"OTA update accepted"のHTML。実際の適用結果は非同期（数秒後に`GET /ota_status.json`で確認）
 - 不正なパッケージは`400`
+- `locked_mode=true`時は`403`
 
 ### `POST /ota/rollback`
 直前の`.bak`バックアップに戻す。パラメータ不要。
 
 - バックアップが存在しない場合は`400`（Web UI上もボタンが無効化される条件と同じ）
 - 受理されると`200`。適用は非同期
+- `locked_mode=true`時は`403`
 
 ### `POST /config/import`
 `config.json`をアップロードして置き換える。Content-Type: `multipart/form-data`。
@@ -132,7 +140,7 @@ OTAパッケージ（zip）を適用する。Content-Type: `multipart/form-data`
 |---|---|
 | `config` | JSONファイル（最大64KB） |
 
-挙動: バリデーション通過後に保存・avahi同期・ブリッジ再起動まで実行。
+挙動: バリデーション通過後に保存・avahi同期・ブリッジ再起動まで実行。アップロードされたJSON内に`locked_mode`が含まれていても無視される（`DEFAULTS`に含まれないキーのため）。`locked_mode=true`の機体では`403`。
 
 ---
 
@@ -152,11 +160,15 @@ OTAパッケージ（zip）を適用する。Content-Type: `multipart/form-data`
     "web_port": 8080,
     "web_user": "admin",
     "web_pass": "cubej1",
-    "log_max_bytes": 10485760
+    "log_max_bytes": 10485760,
+    "adb_enabled": true,
+    "locked_mode": false
 }
 ```
 
 `br_id` / `br_pwd` / `mqtt_host` のいずれかが空の間、ブリッジは`status.json`の`configuration_required=true`のまま待機する。
+
+`locked_mode`は上記の他のキーと異なり、**USBインストール時に`production_tool/config.json`へ直接記述した場合のみ有効**で、`/save`・`/config/import`のいずれからも読み書きされない（`DEFAULTS`/`FIELDS`に含まれない特別なキー）。`true`の場合、LAN外運用を想定し、上記の通り一部エンドポイントが`403`になる。詳細はreadme.mdの「運用環境について（LAN内 / LAN外）」を参照。
 
 ---
 

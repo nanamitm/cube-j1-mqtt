@@ -26,6 +26,12 @@ FILES = [
         "install_to": "/data/local/config_server.py",
         "mode": "755",
     },
+    {
+        "path": "disable_p2p_ap.sh",
+        "source": "production_tool/disable_p2p_ap.sh",
+        "install_to": "/data/local/disable_p2p_ap.sh",
+        "mode": "755",
+    },
 ]
 
 
@@ -60,6 +66,7 @@ def build_manifest(root, version):
         "restart": [
             "mqtt_ha_bridge",
             "cubej_web_ui",
+            "disable_p2p_ap",
         ],
     }
 

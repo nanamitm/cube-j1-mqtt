@@ -3,12 +3,17 @@
 PT="/tmp/production_tool"
 
 # ── ADB settings ──────────────────────────────────────────────────────────────
-setprop service.adb.tcp.port 5555
-setprop persist.adb.tcp.port 5555
-setprop persist.sys.usb.config mtp,adb
-stop adbd
-sleep 1
-start adbd
+# locked_mode only controls ADB-over-network (TCP); USB-cable ADB is left
+# alone either way. Skipped entirely when locked_mode is set, so the
+# network port never comes up even briefly during install.
+if ! grep -q '"locked_mode"[[:space:]]*:[[:space:]]*true' $PT/config.json; then
+    setprop service.adb.tcp.port 5555
+    setprop persist.adb.tcp.port 5555
+    setprop persist.sys.usb.config mtp,adb
+    stop adbd
+    sleep 1
+    start adbd
+fi
 
 # ── Wi-Fi client settings ──────────────────────────────────────────────────────
 cp $PT/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf
