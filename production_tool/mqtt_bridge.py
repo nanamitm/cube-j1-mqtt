@@ -925,7 +925,13 @@ def read_static_properties(mqtt, device_id, fd, ipv6, tid, static_epcs):
     """
     if not static_epcs:
         return {}, tid
-    props, tid = read_measurements(fd, ipv6, tid, static_epcs)
+    try:
+        props, tid = read_measurements(fd, ipv6, tid, static_epcs)
+    except Exception as e:
+        # Never fatal: these are labels. Letting this escape would cost the
+        # caller the polling EPC set it just detected successfully.
+        log("Static properties read failed: {} - continuing without them".format(e))
+        return {}, tid
     values = decode_measurements(props)
     if values:
         publish_measurements(mqtt, device_id, values, retain=True)
@@ -1702,7 +1708,16 @@ def main():
         try:
             if next_action:
                 epcs = resolve_button_epcs(next_action, poll_epcs)
-                log("On-demand poll ({}): {}".format(next_action, format_epcs(epcs)))
+                if not epcs:
+                    # The handler screens presses against the supported set,
+                    # but a reconnect can re-derive it between the press and
+                    # here. Serving the regular poll beats sending an empty
+                    # Get, which would look like a timeout and count towards
+                    # forcing another reconnect.
+                    log("On-demand {}: no longer supported - polling normally".format(next_action))
+                    epcs = poll_epcs
+                else:
+                    log("On-demand poll ({}): {}".format(next_action, format_epcs(epcs)))
             else:
                 epcs = poll_epcs
 
