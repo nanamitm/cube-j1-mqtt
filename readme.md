@@ -130,6 +130,7 @@ Web UI の OTA Update から `cube-j1-mqtt-update.zip` をアップロードす�
 | `web_user` / `web_pass` | 設定用 Web UI の Basic 認証情報 |
 | `log_max_bytes` | `mqtt_bridge.log` / `serial.log` のローテーションしきい値（バイト、デフォルトは `10485760` = 10MB）。上限到達時に `.1` へ退避し、旧 `.1` は削除します |
 | `adb_enabled` | ADBのネットワーク経由アクセス（TCPポート `5555`）の有効/無効（デフォルトは `true`）。本ツールはLAN内での運用を前提としているため既定で有効ですが、Web UIから無効化できます |
+| `pan_cache_enabled` | 前回接続に成功した PAN 情報（チャンネル・PAN ID・MACアドレス）を `/data/local/pan_cache.json` に保存し、次回以降の接続でPANスキャンを省略する（デフォルトは `true`）。詳細は「PAN 情報のキャッシュ」を参照 |
 | `locked_mode` | LAN外運用向けのロックモード（デフォルトは `false`）。USBインストール時にのみ設定可能で、Web UIからは変更できません。詳細は「運用環境について（LAN内 / LAN外）」を参照 |
 
 `br_id`、`br_pwd`、`mqtt_host` が未設定の場合、MQTT ブリッジはスマートメーター接続を開始せず、Web UI 上に `Configuration: required` と不足項目を表示して待機します。
@@ -138,6 +139,18 @@ Web UI で保存すると、通常は MQTT ブリッジが自動的に再起動�
 > [!CAUTION]
 > 設定用 Web UI は HTTP で待ち受けるため、B ルート認証情報や MQTT パスワードを扱う画面を LAN 内に公開します。
 > インターネットへ直接公開せず、信頼できるローカルネットワーク内で利用してください。
+
+## PAN 情報のキャッシュ
+
+Wi-SUN の PAN スキャン（`SKSCAN`）は 1 回あたり 30〜60 秒、リトライが入るとさらに時間がかかります。スマートメーターは移動しないため、接続に成功した PAN 情報（チャンネル・PAN ID・MAC アドレス）を `/data/local/pan_cache.json` に保存し、次回以降の起動・再接続ではスキャンを省略してそのまま `SKJOIN` を試みます（`pan_cache_enabled`、デフォルト有効）。
+
+キャッシュされた PAN での接続に失敗した場合は、キャッシュを破棄して通常どおりフルスキャンを実行し、成功した PAN を新たに保存します。したがってチャンネル変更やメーター交換が起きても自動的に復旧します。
+
+Web UI の Status パネルには、その接続でキャッシュとスキャンのどちらを使ったかが `PAN source`（`cache` / `scan`）として表示されます。
+
+> [!NOTE]
+> Web UI の `Rescan Wi-SUN` は、ブリッジを再起動する前にこのキャッシュを削除します。設置場所を変えて LQI を比較したい場合は、この操作で確実に再スキャンが走ります。
+> `pan_cache_enabled` を無効にすると、次回のブリッジ起動時に既存のキャッシュファイルも削除されます。
 
 ## OTA 更新
 
@@ -250,7 +263,7 @@ production_tool/
 - **MQTT 実装**: MQTT 3.1.1 の仕様に基づきソケット通信を用いて独自実装（QoS 0、TCP keepalive 対応、自動再接続機能あり）。受信専用スレッドがブローカーからのパケット（PINGRESP・ボタン押下の PUBLISH）を処理し、`cubej/{device_id}/command/+` を SUBSCRIBE します。シリアルポートの操作はメインループのみが行い、受信スレッドは取得要求をキューに積むだけです。LWT（Last Will and Testament）にも対応し、ブリッジが正常な切断処理を経ずに落ちた場合、ブローカーが `cubej/{device_id}/status` を自動的に `offline` にします（再接続時は `online` を再送）。HA discovery の各センサーにも `availability_topic` を設定しているため、ブリッジが落ちると該当エンティティが自動的に「unavailable」表示になります。
 - **設定 Web UI**: Python 2.7 標準ライブラリのみで実装した HTTP サーバーを `web_port` で待ち受け、Basic 認証後に `/data/local/config.json` を編集できます。
 - **ステータス表示**: MQTT ブリッジが `/data/local/mqtt_status.json` を更新し、設定 Web UI が接続状態、最終取得値、取得対象 EPC、最終エラーなどを表示します。`/status.json` から JSON としても取得できます。
-- **Wi-SUN 接続**: PAN スキャンを実行し、最も LQI（リンク品質）の良い PAN を自動選択します。
+- **Wi-SUN 接続**: PAN スキャンを実行し、最も LQI（リンク品質）の良い PAN を自動選択します。選択した PAN は `/data/local/pan_cache.json` に保存され、次回以降はスキャンを省略して再接続します（失敗時は自動でフルスキャンにフォールバック）。
 - **対応 EPC の自動判定**: Get プロパティマップ（EPC: 9F）を起動時および再接続時に取得し、対応している追加項目だけをポーリング対象にします。
 - **動作ログ**: ブリッジの動作ログは本体内の `/data/local/mqtt_bridge.log` に追記されます。`log_max_bytes`（デフォルト 10MB）を超えると `.1` へローテーションされ、ディスク使用量は最大でおよそ 2 倍に収まります（`serial.log` も同様）。
 

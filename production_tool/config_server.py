@@ -47,6 +47,7 @@ OTA_VERSION_PATH = "/data/local/cube-j1-mqtt.version"
 OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
+PAN_CACHE_PATH = "/data/local/pan_cache.json"
 AVAHI_CONF_PATH = "/system/etc/avahi-daemon.conf"
 AVAHI_SERVICE_TYPE = "_cubej1-mqtt._tcp"
 AVAHI_PUBLISH_PID_PATH = "/data/local/avahi_publish.pid"
@@ -90,6 +91,7 @@ DEFAULTS = collections.OrderedDict([
     ("web_pass", "cubej1"),
     ("log_max_bytes", 10 * 1024 * 1024),
     ("adb_enabled", True),
+    ("pan_cache_enabled", True),
 ])
 
 FIELDS = [
@@ -107,10 +109,11 @@ FIELDS = [
     ("web_pass", "Web Password", "password"),
     ("log_max_bytes", "Log Max Size (bytes)", "number"),
     ("adb_enabled", "ADB over network (port 5555)", "checkbox"),
+    ("pan_cache_enabled", "Reuse last PAN (skip scan on restart)", "checkbox"),
 ]
 
 INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port", "log_max_bytes"])
-BOOL_FIELDS = set(["adb_enabled"])
+BOOL_FIELDS = set(["adb_enabled", "pan_cache_enabled"])
 SECTION_NAMES = ["status", "measurements", "config", "maintenance", "logs"]
 
 
@@ -628,6 +631,18 @@ def restart_bridge():
     log("restart_bridge rc={}".format(rc))
 
 
+def clear_pan_cache():
+    # The bridge re-joins from the cached PAN instead of scanning, so a
+    # "Rescan Wi-SUN" that only restarted the bridge would rejoin the exact
+    # same PAN and never refresh Channel/PAN ID/LQI.
+    try:
+        if os.path.exists(PAN_CACHE_PATH):
+            os.remove(PAN_CACHE_PATH)
+            log("pan cache cleared")
+    except Exception as e:
+        log("pan cache clear failed: {}".format(e))
+
+
 def reboot_device():
     rc = os.system("(sleep 1; reboot) >/dev/null 2>&1 &")
     log("reboot_device rc={}".format(rc))
@@ -899,6 +914,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 return
             params = parse_post_params(self)
             active_section = normalize_section_name(params.get("next_section", ["maintenance"])[0], "maintenance")
+            clear_pan_cache()
             restart_bridge()
             self._send(200, self._render_form(
                 message="Wi-SUN rescan requested. The MQTT bridge is restarting and will rejoin the meter; "
@@ -1302,7 +1318,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
         groups = [
             ("B-route", ["br_id", "br_pwd"]),
             ("MQTT", ["mqtt_host", "mqtt_port", "mqtt_user", "mqtt_pass"]),
-            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes", "adb_enabled"]),
+            ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes", "adb_enabled", "pan_cache_enabled"]),
         ]
 
         sections = []
@@ -1520,6 +1536,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>Wi-SUN Channel</span><strong>{wisun_channel}</strong></div>
 <div class="item"><span>Wi-SUN PAN ID</span><strong>{wisun_pan_id}</strong></div>
 <div class="item"><span>Wi-SUN LQI</span><strong>{wisun_lqi}</strong></div>
+<div class="item"><span>PAN source</span><strong>{wisun_pan_source}</strong></div>
 <div class="item"><span>Meter IPv6</span><strong>{meter_ipv6}</strong></div>
 <div class="item"><span>Installation Place</span><strong>{installation_place}</strong></div>
 <div class="item"><span>Maker Code</span><strong>{maker_code}</strong></div>
@@ -1555,6 +1572,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
             wisun_channel=self._status_value(status, "wisun_channel"),
             wisun_pan_id=self._status_value(status, "wisun_pan_id"),
             wisun_lqi=self._status_value(status, "wisun_lqi"),
+            wisun_pan_source=self._status_value(status, "wisun_pan_source"),
             installation_place=self._status_value(last_values, "installation_place"),
             maker_code=self._status_value(last_values, "maker_code"),
             serial_number=self._status_value(last_values, "serial_number"),

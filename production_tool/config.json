@@ -13,5 +13,6 @@
     "web_pass": "cubej1",
     "log_max_bytes": 10485760,
     "adb_enabled": true,
+    "pan_cache_enabled": true,
     "locked_mode": false
 }

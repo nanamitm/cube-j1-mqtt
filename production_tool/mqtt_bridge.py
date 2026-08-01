@@ -27,6 +27,11 @@ LOG_PATH    = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
 STATUS_PATH = "/data/local/mqtt_status.json"
 OTA_STATUS_PATH = "/data/local/ota_status.json"
+PAN_CACHE_PATH = "/data/local/pan_cache.json"
+
+# Skip the PAN scan on reconnect by re-using the last PAN that worked
+# (config.json's pan_cache_enabled overrides this).
+PAN_CACHE_ENABLED = True
 
 # Log files rotate to ".1" once they reach this size (config.json's
 # log_max_bytes overrides this); the previous ".1" is dropped, so each log's
@@ -408,32 +413,56 @@ def skll64(fd, mac):
             continue
     return None
 
-def wisun_connect(fd, br_id, br_pwd):
-    """Full SKSTACK-IP join sequence. Returns IPv6 address of meter."""
-    log("SKRESET")
-    skcommand(fd, "SKRESET", timeout=5)
-    time.sleep(1)
+PAN_CACHE_KEYS = ("Channel", "Pan ID", "Addr")
 
-    log("SKSETPWD")
-    skcommand(fd, "SKSETPWD C {}".format(br_pwd))
+def load_pan_cache():
+    """Last PAN that produced a successful join, or None."""
+    if not PAN_CACHE_ENABLED:
+        return None
+    try:
+        with open(PAN_CACHE_PATH) as f:
+            pan = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(pan, dict) or not all(pan.get(key) for key in PAN_CACHE_KEYS):
+        log("PAN cache is incomplete - ignoring it")
+        return None
+    return pan
 
-    log("SKSETRBID")
-    skcommand(fd, "SKSETRBID {}".format(br_id))
+def save_pan_cache(pan):
+    if not PAN_CACHE_ENABLED:
+        return
+    data = dict((key, pan.get(key)) for key in PAN_CACHE_KEYS)
+    data["LQI"] = pan.get("LQI", "")
+    data["saved_at"] = now_str()
+    tmp_path = PAN_CACHE_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.rename(tmp_path, PAN_CACHE_PATH)
+    except Exception as e:
+        log("PAN cache write failed: {}".format(e))
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
-    # Force ASCII-hex ERXUDP payload format so parser stays stable.
-    skcommand(fd, "WOPT 1")
+def clear_pan_cache(reason):
+    if not os.path.exists(PAN_CACHE_PATH):
+        return
+    try:
+        os.remove(PAN_CACHE_PATH)
+        log("PAN cache discarded: {}".format(reason))
+    except Exception as e:
+        log("PAN cache remove failed: {}".format(e))
 
-    log("SKSCAN (may take up to 60s)")
-    pan = skscan(fd)
-    if not pan.get("Channel") or not pan.get("Pan ID") or not pan.get("Addr"):
-        raise RuntimeError("SKSCAN: no PAN found ({})".format(pan))
-
+def join_pan(fd, pan):
+    """SKLL64 + channel/PAN registers + SKJOIN. Returns the meter's IPv6."""
     channel = pan["Channel"]
     pan_id  = pan["Pan ID"]
     mac     = pan["Addr"]
-    lqi     = pan.get("LQI", "")
-    log("PAN found: ch={} panId={} mac={} lqi={}".format(channel, pan_id, mac, lqi))
-    write_status(wisun_channel=channel, wisun_pan_id=pan_id, wisun_lqi=lqi)
+    write_status(wisun_channel=channel, wisun_pan_id=pan_id, wisun_lqi=pan.get("LQI", ""))
 
     ipv6 = skll64(fd, mac)
     if not ipv6:
@@ -469,6 +498,49 @@ def wisun_connect(fd, br_id, br_pwd):
         led_rgb(*orig_led)
 
     raise RuntimeError("SKJOIN: timeout")
+
+def wisun_connect(fd, br_id, br_pwd):
+    """Full SKSTACK-IP join sequence. Returns IPv6 address of meter."""
+    log("SKRESET")
+    skcommand(fd, "SKRESET", timeout=5)
+    time.sleep(1)
+
+    log("SKSETPWD")
+    skcommand(fd, "SKSETPWD C {}".format(br_pwd))
+
+    log("SKSETRBID")
+    skcommand(fd, "SKSETRBID {}".format(br_id))
+
+    # Force ASCII-hex ERXUDP payload format so parser stays stable.
+    skcommand(fd, "WOPT 1")
+
+    # A scan costs 30-60s (more when it retries) and the meter isn't going
+    # to move, so the last PAN that worked is tried first. Anything that
+    # goes wrong with it just falls through to a normal scan.
+    cached = load_pan_cache()
+    if cached:
+        log("Using cached PAN: ch={} panId={} mac={} lqi={} (saved {})".format(
+            cached.get("Channel"), cached.get("Pan ID"), cached.get("Addr"),
+            cached.get("LQI", ""), cached.get("saved_at", "?")))
+        write_status(wisun_pan_source="cache")
+        try:
+            return join_pan(fd, cached)
+        except Exception as e:
+            log("Join with cached PAN failed: {} - falling back to a full scan".format(e))
+            clear_pan_cache("join failed")
+
+    log("SKSCAN (may take up to 60s)")
+    write_status(wisun_pan_source="scan")
+    pan = skscan(fd)
+    if not pan.get("Channel") or not pan.get("Pan ID") or not pan.get("Addr"):
+        raise RuntimeError("SKSCAN: no PAN found ({})".format(pan))
+
+    log("PAN found: ch={} panId={} mac={} lqi={}".format(
+        pan["Channel"], pan["Pan ID"], pan["Addr"], pan.get("LQI", "")))
+
+    ipv6 = join_pan(fd, pan)
+    save_pan_cache(pan)
+    return ipv6
 
 # ---------------------------------------------------------------------------
 # ECHONET Lite frame builder / parser
@@ -1413,7 +1485,7 @@ def make_command_handler(device_id, command_queue, command_event, poll_epcs_ref)
     return on_message
 
 def main():
-    global _log_file, _serial_log_file, LOG_MAX_BYTES
+    global _log_file, _serial_log_file, LOG_MAX_BYTES, PAN_CACHE_ENABLED
     try:
         _log_file = open(LOG_PATH, "a")
     except Exception:
@@ -1440,6 +1512,11 @@ def main():
     device_id     = cfg.get("device_id", "cubej1")
     serial_port   = cfg.get("serial_port", "/dev/ttyS1")
     poll_interval = int(cfg.get("poll_interval", 60))
+    PAN_CACHE_ENABLED = bool(cfg.get("pan_cache_enabled", PAN_CACHE_ENABLED))
+    if not PAN_CACHE_ENABLED:
+        # Drop any existing entry now rather than at re-enable time, so
+        # turning the cache back on later can't resurrect a stale PAN.
+        clear_pan_cache("pan_cache_enabled is off")
 
     log("=== mqtt_bridge start device_id={} ===".format(device_id))
     write_status(bridge_started_at=now_str(),
@@ -1456,6 +1533,8 @@ def main():
                  wisun_channel=None,
                  wisun_pan_id=None,
                  wisun_lqi=None,
+                 wisun_pan_source=None,
+                 pan_cache_enabled=PAN_CACHE_ENABLED,
                  gettable_epcs=[],
                  polling_epcs=epcs_to_hex(DEFAULT_EPCS),
                  last_measurement_at=None,
