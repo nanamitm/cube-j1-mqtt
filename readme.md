@@ -49,6 +49,21 @@ Home Assistant 上で以下のセンサーとしてデータを取り扱うこ�
 ※ 係数（EPC: D3）および積算電力量単位（EPC: E1）も自動で取得し、積算電力量の正確な kWh 換算に適用します。
 ※ 起動時に Get プロパティマップ（EPC: 9F）を取得し、スマートメーターが対応している追加 EPC のみを定期取得します。対応していない場合は従来の基本センサーのみ取得します。
 
+## オンデマンド取得ボタン
+
+ポーリング間隔（`poll_interval`）を待たずに、その場でスマートメーターから値を取得するためのボタンを Home Assistant 上に自動登録します。
+
+| ボタン名 | 取得する内容 | 対象 EPC |
+|---|---|---|
+| Refresh Instantaneous Values | 瞬時電力・瞬時電流 | E7, E8 |
+| Refresh Cumulative Energy | 積算電力量（正/逆）・定時積算電力量 | E0, E3, EA, EB |
+| Refresh One Minute Energy | 1分積算電力量 | D0 |
+| Refresh All | 定期ポーリングと同じ全項目 | 定期取得対象すべて |
+
+※ 積算電力量系のボタンは、kWh 換算のため係数（D3）と積算電力量単位（E1）も併せて取得します。
+※ Get プロパティマップ（EPC: 9F）の結果に応じて、そのスマートメーターで取得できない項目のボタンは登録されません（例：1分積算電力量に非対応の第1世代メーターでは Refresh One Minute Energy は表示されません）。
+※ 連打による Wi-SUN のデューティサイクル超過を避けるため、オンデマンド取得は **10 秒に 1 回**までに制限されます。制限中の押下は破棄されず、次に実行可能になったタイミングで処理されます。同じボタンを連続して押した場合は 1 回にまとめられます。
+
 ## 導入方法
 
 Cube J1 は USB メモリ内の特定ファイル構成を検出すると自動的にスクリプトを実行する仕組みを持っています。
@@ -232,7 +247,7 @@ production_tool/
 - **実行環境**: Cube J1 上の Android 系 Linux（Python 2.7 にて動作）
 - **依存ライブラリ**: Python 2.7 標準ライブラリのみを使用（`termios`, `socket`, `struct`, `select`, `json`, `threading` など）。`pyserial` や `paho-mqtt` 等の外部ライブラリは不要です。
 - **シリアル通信**: `termios` にて raw モードを設定し、115200 bps で通信します。
-- **MQTT 実装**: MQTT 3.1.1 の仕様に基づきソケット通信を用いて独自実装（QoS 0、TCP keepalive 対応、自動再接続機能あり）。LWT（Last Will and Testament）にも対応し、ブリッジが正常な切断処理を経ずに落ちた場合、ブローカーが `cubej/{device_id}/status` を自動的に `offline` にします（再接続時は `online` を再送）。HA discovery の各センサーにも `availability_topic` を設定しているため、ブリッジが落ちると該当エンティティが自動的に「unavailable」表示になります。
+- **MQTT 実装**: MQTT 3.1.1 の仕様に基づきソケット通信を用いて独自実装（QoS 0、TCP keepalive 対応、自動再接続機能あり）。受信専用スレッドがブローカーからのパケット（PINGRESP・ボタン押下の PUBLISH）を処理し、`cubej/{device_id}/command/+` を SUBSCRIBE します。シリアルポートの操作はメインループのみが行い、受信スレッドは取得要求をキューに積むだけです。LWT（Last Will and Testament）にも対応し、ブリッジが正常な切断処理を経ずに落ちた場合、ブローカーが `cubej/{device_id}/status` を自動的に `offline` にします（再接続時は `online` を再送）。HA discovery の各センサーにも `availability_topic` を設定しているため、ブリッジが落ちると該当エンティティが自動的に「unavailable」表示になります。
 - **設定 Web UI**: Python 2.7 標準ライブラリのみで実装した HTTP サーバーを `web_port` で待ち受け、Basic 認証後に `/data/local/config.json` を編集できます。
 - **ステータス表示**: MQTT ブリッジが `/data/local/mqtt_status.json` を更新し、設定 Web UI が接続状態、最終取得値、取得対象 EPC、最終エラーなどを表示します。`/status.json` から JSON としても取得できます。
 - **Wi-SUN 接続**: PAN スキャンを実行し、最も LQI（リンク品質）の良い PAN を自動選択します。
@@ -243,7 +258,9 @@ production_tool/
 
 | 用途 | トピック |
 |---|---|
-| HA auto-discovery | `homeassistant/sensor/{device_id}/{sensor_id}/config` |
+| HA auto-discovery（センサー） | `homeassistant/sensor/{device_id}/{sensor_id}/config` |
+| HA auto-discovery（ボタン） | `homeassistant/button/{device_id}/{button_id}/config` |
+| オンデマンド取得コマンド（Subscribe） | `cubej/{device_id}/command/{button_id}` |
 | 瞬時電力 | `cubej/{device_id}/power` |
 | 積算電力量（正方向） | `cubej/{device_id}/energy_forward` |
 | 積算電力量（逆方向） | `cubej/{device_id}/energy_reverse` |

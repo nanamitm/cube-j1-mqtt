@@ -869,10 +869,16 @@ def _encode_str(s):
     return struct.pack(">H", len(b)) + b
 
 MQTT_OUT_QUEUE_MAX = 200
+PING_RESPONSE_TIMEOUT = 20
+
+def _byte_at(buf, index):
+    b = buf[index]
+    return b if isinstance(b, int) else ord(b)
 
 class MQTTClient(object):
     def __init__(self, host, port, client_id, username=None, password=None,
-                 will_topic=None, will_payload=None, will_retain=False):
+                 will_topic=None, will_payload=None, will_retain=False,
+                 subscriptions=None, on_message=None):
         self.host      = host
         self.port      = port
         self.client_id = client_id
@@ -881,8 +887,15 @@ class MQTTClient(object):
         self.will_topic   = will_topic
         self.will_payload = will_payload
         self.will_retain  = will_retain
+        self.subscriptions = list(subscriptions or [])
+        self.on_message    = on_message
         self.sock      = None
         self._out_queue = collections.deque()
+        self._send_lock = threading.Lock()
+        self._packet_id = 0
+        # Set when a PINGREQ has gone out and its PINGRESP is still
+        # outstanding; cleared by the receive thread.
+        self._pending_ping_since = None
 
     def start(self):
         """Connect in the background and keep reconnecting on failure.
@@ -986,11 +999,20 @@ class MQTTClient(object):
             raise RuntimeError("MQTT: connection refused code {}".format(rc))
 
         self.sock = s
+        self._pending_ping_since = None
         log("MQTT connected to {}:{}".format(self.host, self.port))
         write_status(mqtt_connected=True,
                      mqtt_host=self.host,
                      mqtt_port=self.port,
                      last_error="")
+
+        # The receive thread is bound to this specific socket, so a later
+        # reconnect's thread can never race the old one over self.sock.
+        rx = threading.Thread(target=self._recv_loop, args=(s,))
+        rx.daemon = True
+        rx.start()
+
+        self._subscribe_all()
 
         # Republish "online" on every (re)connect - the broker only sends
         # our will message ("offline") on an ungraceful disconnect, so the
@@ -1015,13 +1037,22 @@ class MQTTClient(object):
         remaining = var_hdr + payload_b
         return struct.pack("B", fixed) + _encode_remaining(len(remaining)) + remaining
 
-    def publish(self, topic, payload, retain=False):
+    def _send_raw(self, pkt):
+        # Serialized: the connect thread publishes "online"/flushes the queue
+        # while the main loop may be publishing measurements, and two
+        # interleaved sendall() calls would corrupt the packet stream.
         sock = self.sock
         if not sock:
+            raise RuntimeError("MQTT: not connected")
+        with self._send_lock:
+            sock.sendall(pkt)
+
+    def publish(self, topic, payload, retain=False):
+        if not self.sock:
             self._queue(topic, payload, retain)
             return
         try:
-            sock.sendall(self._make_pkt(topic, payload, retain))
+            self._send_raw(self._make_pkt(topic, payload, retain))
         except Exception as e:
             log("MQTT publish error: {}".format(e))
             self._drop_connection(e)
@@ -1031,28 +1062,105 @@ class MQTTClient(object):
         while self._out_queue and self.sock:
             topic, payload, retain = self._out_queue[0]
             try:
-                pkt = self._make_pkt(topic, payload, retain)
-                self.sock.sendall(pkt)
+                self._send_raw(self._make_pkt(topic, payload, retain))
                 self._out_queue.popleft()
             except Exception as e:
                 log("MQTT queued publish failed: {}".format(e))
                 break
 
-    def ping(self):
-        sock = self.sock
-        if not sock:
+    def _subscribe_all(self):
+        if not self.subscriptions:
+            return
+        self._packet_id = (self._packet_id % 65535) + 1
+        payload = struct.pack(">H", self._packet_id)
+        for topic in self.subscriptions:
+            payload += _encode_str(topic) + b"\x00"   # requested QoS 0
+        self._send_raw(b"\x82" + _encode_remaining(len(payload)) + payload)
+        log("MQTT subscribe: {}".format(", ".join(self.subscriptions)))
+
+    def _recv_exact(self, sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def _recv_remaining_length(self, sock):
+        multiplier = 1
+        value = 0
+        for _ in range(4):
+            chunk = self._recv_exact(sock, 1)
+            if chunk is None:
+                return None
+            byte = _byte_at(chunk, 0)
+            value += (byte & 0x7F) * multiplier
+            if not byte & 0x80:
+                return value
+            multiplier *= 128
+        return None
+
+    def _recv_loop(self, sock):
+        """Read packets off `sock` until it dies, dispatching to on_message.
+
+        Everything the broker sends has to be drained here: before
+        subscriptions existed, ping() could get away with recv()ing its
+        own PINGRESP inline, but an inbound PUBLISH arriving at the wrong
+        moment would have been mistaken for one.
+        """
+        try:
+            while True:
+                header = self._recv_exact(sock, 1)
+                if header is None:
+                    break
+                first_byte = _byte_at(header, 0)
+                remaining = self._recv_remaining_length(sock)
+                if remaining is None:
+                    break
+                body = self._recv_exact(sock, remaining) if remaining else b""
+                if body is None:
+                    break
+                packet_type = first_byte & 0xF0
+                if packet_type == 0xD0:      # PINGRESP
+                    self._pending_ping_since = None
+                elif packet_type == 0x30:    # PUBLISH
+                    self._dispatch_publish(first_byte, body)
+        except Exception as e:
+            log("MQTT receive error: {}".format(e))
+        # A connection we already tore down elsewhere must not be reported twice.
+        if self.sock is sock:
+            self._drop_connection("connection closed by broker")
+
+    def _dispatch_publish(self, first_byte, body):
+        if len(body) < 2:
+            return
+        topic_len = struct.unpack(">H", bytes(body[:2]))[0]
+        pos = 2 + topic_len
+        if len(body) < pos:
+            return
+        topic = body[2:pos].decode("utf-8", "replace")
+        if (first_byte >> 1) & 0x03:
+            pos += 2   # packet identifier; only present above QoS 0
+        payload = body[pos:].decode("utf-8", "replace")
+        if not self.on_message:
             return
         try:
-            sock.sendall(b"\xC0\x00")
-            r, _, _ = select.select([sock], [], [], 5)
-            if not r:
-                raise RuntimeError("PINGRESP timeout (no data within 5s)")
-            resp = sock.recv(2)
-            if not resp or len(resp) < 2:
-                raise RuntimeError("PINGRESP incomplete response (len={})".format(len(resp)))
-            first_byte = resp[0] if isinstance(resp[0], int) else ord(resp[0])
-            if first_byte != 0xD0:
-                raise RuntimeError("PINGRESP unexpected first_byte=0x{:02X}".format(first_byte))
+            self.on_message(topic, payload)
+        except Exception as e:
+            log("MQTT on_message error: {}".format(e))
+
+    def ping(self):
+        if not self.sock:
+            return
+        if (self._pending_ping_since is not None and
+                time.time() - self._pending_ping_since > PING_RESPONSE_TIMEOUT):
+            self._drop_connection("PINGRESP timeout ({}s)".format(PING_RESPONSE_TIMEOUT))
+            return
+        try:
+            self._send_raw(b"\xC0\x00")
+            if self._pending_ping_since is None:
+                self._pending_ping_since = time.time()
         except Exception as e:
             log("MQTT ping error: {}".format(e))
             self._drop_connection(e)
@@ -1084,6 +1192,81 @@ SENSOR_DEFS = [
     ("maker_code",                    "Maker Code",                None,  None,      None),
     ("serial_number",                 "Serial Number",             None,  None,      None),
 ]
+
+# Buttons that trigger an immediate read instead of waiting out poll_interval.
+# Each is (id, label, primary EPCs, support EPCs); primary None means "whatever
+# the regular poll asks for". The split matters: D3/E1 are only fetched so the
+# kWh conversion has a current coefficient and unit, so a button whose primary
+# EPCs are all unsupported is useless even though D3/E1 would still resolve.
+BUTTON_DEFS = [
+    ("refresh_instant",    "Refresh Instantaneous Values", [0xE7, 0xE8],             []),
+    ("refresh_cumulative", "Refresh Cumulative Energy",    [0xE0, 0xE3, 0xEA, 0xEB], [0xD3, 0xE1]),
+    ("refresh_one_minute", "Refresh One Minute Energy",    [0xD0],                   [0xD3, 0xE1]),
+    ("refresh_all",        "Refresh All",                  None,                     []),
+]
+BUTTON_ACTIONS = dict((bid, (primary, support)) for bid, _, primary, support in BUTTON_DEFS)
+
+# A press is answered on the next pass through the main loop, but no faster
+# than this - the Wi-SUN duty cycle doesn't survive an automation that
+# presses a button in a tight loop.
+ON_DEMAND_MIN_INTERVAL = 10
+ON_DEMAND_QUEUE_MAX = 4
+
+def command_topic(device_id, action):
+    return "cubej/{}/command/{}".format(device_id, action)
+
+def command_topic_filter(device_id):
+    return "cubej/{}/command/+".format(device_id)
+
+def resolve_button_epcs(action, poll_epcs):
+    """EPCs a button press should read, restricted to what the meter supports.
+
+    Empty means the button has nothing to offer on this meter - either the
+    action is unknown, or none of its primary EPCs are in the property map.
+    """
+    entry = BUTTON_ACTIONS.get(action)
+    if entry is None:
+        return []
+    primary, support = entry
+    if primary is None:
+        return list(poll_epcs)
+    wanted = [epc for epc in primary if epc in poll_epcs]
+    if not wanted:
+        return []
+    return [epc for epc in support if epc in poll_epcs] + wanted
+
+def publish_button_discovery(mqtt, device_id, poll_epcs):
+    """(Re)publish button discovery, dropping buttons this meter can't serve.
+
+    Called after the property map is known rather than at startup so a
+    meter without, say, D0 doesn't get a One Minute button that could
+    only ever no-op. Unsupported ones are cleared with an empty retained
+    payload in case an earlier run did publish them.
+    """
+    device = {
+        "identifiers": [device_id],
+        "name":         "Cube J1 Smart Meter",
+        "model":        "Cube J1",
+        "manufacturer": "NextDrive",
+    }
+    availability_topic = "cubej/{}/status".format(device_id)
+    for bid, name, _, _ in BUTTON_DEFS:
+        topic = "homeassistant/button/{}/{}/config".format(device_id, bid)
+        if not resolve_button_epcs(bid, poll_epcs):
+            mqtt.publish(topic, "", retain=True)
+            log("HA discovery: removed unsupported button {}".format(bid))
+            continue
+        mqtt.publish(topic, {
+            "name":               name,
+            "unique_id":          "{}_{}".format(device_id, bid),
+            "command_topic":      command_topic(device_id, bid),
+            "payload_press":      "PRESS",
+            "availability_topic": availability_topic,
+            "payload_available":  "online",
+            "payload_not_available": "offline",
+            "device":             device,
+        }, retain=True)
+        log("HA discovery: {}".format(topic))
 
 def publish_ha_discovery(mqtt, device_id):
     device = {
@@ -1162,6 +1345,73 @@ def publish_bridge_status(mqtt, device_id):
 # Main
 # ---------------------------------------------------------------------------
 
+def wait_for_next_poll(poll_interval, command_queue, command_event, last_on_demand):
+    """Block until the next scheduled poll is due, or a button press arrives.
+
+    Returns the queued action name, or None when poll_interval simply
+    elapsed. Presses that come in faster than ON_DEMAND_MIN_INTERVAL stay
+    queued until the rate limit lets them through (or until the regular
+    poll overtakes them, which serves the same data anyway).
+    """
+    deadline = time.time() + poll_interval
+    while True:
+        # Cleared before looking at the queue, never after: a press landing
+        # between the check and the clear would otherwise have its wakeup
+        # swallowed and sit unserved until the next scheduled poll.
+        command_event.clear()
+        now = time.time()
+        if command_queue:
+            ready_at = last_on_demand[0] + ON_DEMAND_MIN_INTERVAL
+            if now >= ready_at:
+                last_on_demand[0] = now
+                return command_queue.popleft()
+            timeout = min(ready_at - now, deadline - now)
+        else:
+            timeout = deadline - now
+        if timeout <= 0:
+            return None
+        command_event.wait(timeout)
+
+def sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref):
+    """Publish the polling EPCs to the command handler and the button set.
+
+    The supported-EPC set is re-derived on every reconnect, so both the
+    handler's accept list and HA's buttons have to follow it rather than
+    being fixed at startup.
+    """
+    poll_epcs_ref[0] = poll_epcs
+    publish_button_discovery(mqtt, device_id, poll_epcs)
+
+def make_command_handler(device_id, command_queue, command_event, poll_epcs_ref):
+    """Build the MQTT callback that turns button presses into poll requests.
+
+    Runs on the MQTT receive thread, so it only ever enqueues - the serial
+    port stays owned by the main loop.
+    """
+    prefix = "cubej/{}/command/".format(device_id)
+
+    def on_message(topic, payload):
+        if not topic.startswith(prefix):
+            log("Ignoring message on unexpected topic: {}".format(topic))
+            return
+        action = topic[len(prefix):]
+        if action not in BUTTON_ACTIONS:
+            log("Ignoring unknown command: {}".format(action))
+            return
+        if not resolve_button_epcs(action, poll_epcs_ref[0]):
+            log("Ignoring command {}: this meter supports none of its EPCs".format(action))
+            return
+        if action in command_queue:
+            return   # already pending; pressing twice fetches the same values
+        if len(command_queue) >= ON_DEMAND_QUEUE_MAX:
+            log("On-demand queue is full - dropping {}".format(action))
+            return
+        command_queue.append(action)
+        command_event.set()
+        log("On-demand request: {} (payload={})".format(action, payload.strip()[:32]))
+
+    return on_message
+
 def main():
     global _log_file, _serial_log_file, LOG_MAX_BYTES
     try:
@@ -1212,13 +1462,24 @@ def main():
                  last_values={},
                  last_error="")
 
+    # Button presses arrive on the MQTT thread and are handed to the main
+    # loop through this queue; poll_epcs_ref lets the handler reject actions
+    # the meter can't serve without reaching into the loop's locals.
+    command_queue = collections.deque()
+    command_event = threading.Event()
+    poll_epcs_ref = [list(DEFAULT_EPCS)]
+    last_on_demand = [0.0]
+
     # Connect MQTT in the background; Wi-SUN setup below must not wait on it.
     # A will (LWT) is registered so Home Assistant marks entities
     # "unavailable" if the bridge disappears without a clean disconnect.
     status_topic = "cubej/{}/status".format(device_id)
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
                       username=ha_user, password=ha_pass,
-                      will_topic=status_topic, will_payload="offline", will_retain=True)
+                      will_topic=status_topic, will_payload="offline", will_retain=True,
+                      subscriptions=[command_topic_filter(device_id)],
+                      on_message=make_command_handler(device_id, command_queue,
+                                                      command_event, poll_epcs_ref))
     mqtt.start()
 
     publish_ha_discovery(mqtt, device_id)
@@ -1264,13 +1525,21 @@ def main():
     except Exception as e:
         log("EPC detection failed: {} - polling default EPCs only".format(e))
         poll_epcs = list(DEFAULT_EPCS)
+    sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
 
+    next_action = None
     while True:
         try:
+            if next_action:
+                epcs = resolve_button_epcs(next_action, poll_epcs)
+                log("On-demand poll ({}): {}".format(next_action, format_epcs(epcs)))
+            else:
+                epcs = poll_epcs
+
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
-                props, tid = read_measurements(fd, ipv6, tid, poll_epcs)
+                props, tid = read_measurements(fd, ipv6, tid, epcs)
                 if props:
                     m     = decode_measurements(props)
                     m     = apply_energy_scale(m, coeff, unit_kwh)
@@ -1307,6 +1576,7 @@ def main():
                     log("Wi-SUN reconnect after repeated timeouts failed: {}".format(e2))
                     write_status(wisun_connected=False,
                                  last_error="Wi-SUN reconnect failed: {}".format(e2))
+                sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
                 consecutive_timeouts = 0
 
             if time.time() - last_ping > 50:
@@ -1317,13 +1587,15 @@ def main():
                 publish_bridge_status(mqtt, device_id)
                 last_status_publish = time.time()
 
-            time.sleep(poll_interval)
+            next_action = wait_for_next_poll(poll_interval, command_queue,
+                                             command_event, last_on_demand)
 
         except Exception as e:
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
             write_status(wisun_connected=False,
                          last_error="Main loop error: {}".format(e))
             consecutive_timeouts = 0
+            next_action = None
             try:
                 publish_bridge_status(mqtt, device_id)
                 last_status_publish = time.time()
@@ -1336,6 +1608,7 @@ def main():
                 log("Wi-SUN reconnect failed: {}".format(e2))
                 write_status(wisun_connected=False,
                              last_error="Wi-SUN reconnect failed: {}".format(e2))
+            sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
 
 
 if __name__ == "__main__":
