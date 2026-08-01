@@ -92,6 +92,16 @@ DEFAULTS = collections.OrderedDict([
     ("log_max_bytes", 10 * 1024 * 1024),
     ("adb_enabled", True),
     ("pan_cache_enabled", True),
+    # Wi-SUN timing/retry knobs; defaults match mqtt_bridge.TUNING_DEFAULTS.
+    ("scan_duration_start", 4),
+    ("scan_duration_max", 10),
+    ("join_timeout", 90),
+    ("response_timeout", 15),
+    ("property_map_max_retries", 3),
+    ("property_map_retry_delay", 3),
+    ("request_interval_ms", 0),
+    ("max_consecutive_timeouts", 3),
+    ("wisun_retry_delay", 60),
 ])
 
 FIELDS = [
@@ -110,9 +120,38 @@ FIELDS = [
     ("log_max_bytes", "Log Max Size (bytes)", "number"),
     ("adb_enabled", "ADB over network (port 5555)", "checkbox"),
     ("pan_cache_enabled", "Reuse last PAN (skip scan on restart)", "checkbox"),
+    ("scan_duration_start", "Scan Duration Start (2-14)", "number"),
+    ("scan_duration_max", "Scan Duration Max (2-14)", "number"),
+    ("join_timeout", "SKJOIN Timeout (sec)", "number"),
+    ("response_timeout", "Response Timeout (sec)", "number"),
+    ("property_map_max_retries", "Property Map Retries", "number"),
+    ("property_map_retry_delay", "Property Map Retry Delay (sec)", "number"),
+    ("request_interval_ms", "Delay Between Requests (ms)", "number"),
+    ("max_consecutive_timeouts", "Timeouts Before Rejoin", "number"),
+    ("wisun_retry_delay", "Join Retry Delay (sec)", "number"),
 ]
 
-INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port", "log_max_bytes"])
+TUNING_FIELDS = ["scan_duration_start", "scan_duration_max", "join_timeout",
+                 "response_timeout", "property_map_max_retries",
+                 "property_map_retry_delay", "request_interval_ms",
+                 "max_consecutive_timeouts", "wisun_retry_delay"]
+
+# Accepted range per tuning key. The upper bounds are deliberately generous -
+# they exist to catch typos (a stray zero turning 15s into 150s of blocking),
+# not to second-guess someone tuning for a marginal Wi-SUN link.
+TUNING_RANGES = {
+    "scan_duration_start":      (2, 14),
+    "scan_duration_max":        (2, 14),
+    "join_timeout":             (10, 600),
+    "response_timeout":         (3, 120),
+    "property_map_max_retries": (1, 10),
+    "property_map_retry_delay": (0, 120),
+    "request_interval_ms":      (0, 10000),
+    "max_consecutive_timeouts": (1, 50),
+    "wisun_retry_delay":        (10, 3600),
+}
+
+INT_FIELDS = set(["mqtt_port", "poll_interval", "web_port", "log_max_bytes"] + TUNING_FIELDS)
 BOOL_FIELDS = set(["adb_enabled", "pan_cache_enabled"])
 SECTION_NAMES = ["status", "measurements", "config", "maintenance", "logs"]
 
@@ -185,8 +224,12 @@ def save_config(cfg):
 def validate_config_values(cfg):
     errors = []
     for key in INT_FIELDS:
+        # Absent keys fall back to the default, not 0: a config.json written
+        # before a knob existed would otherwise coerce to 0 and be rejected
+        # by that knob's range check, blocking every save until the user
+        # filled in a field they never set.
         try:
-            cfg[key] = int(cfg.get(key, 0))
+            cfg[key] = int(cfg.get(key, DEFAULTS.get(key, 0)))
         except Exception:
             errors.append("{} must be a number".format(key))
 
@@ -202,6 +245,21 @@ def validate_config_values(cfg):
         errors.append("web_user must not be empty")
     if cfg.get("log_max_bytes", 0) < 65536:
         errors.append("log_max_bytes must be at least 65536 (64KB)")
+
+    for key, (low, high) in sorted(TUNING_RANGES.items()):
+        value = cfg.get(key)
+        if not isinstance(value, int):
+            continue   # already reported as "must be a number" above
+        if value < low or value > high:
+            errors.append("{} must be between {} and {}".format(key, low, high))
+    if (isinstance(cfg.get("scan_duration_start"), int)
+            and isinstance(cfg.get("scan_duration_max"), int)
+            and cfg["scan_duration_max"] < cfg["scan_duration_start"]):
+        # skscan() walks duration upward from start to max, so an inverted
+        # pair would skip the loop entirely and report "no PAN found"
+        # without ever transmitting a scan.
+        errors.append("scan_duration_max must be greater than or equal to scan_duration_start")
+
     for key in BOOL_FIELDS:
         cfg[key] = cfg.get(key) in ("1", "true", "True", True)
     return errors
@@ -1319,6 +1377,7 @@ summary {{ cursor: pointer; font-weight: 600; }}
             ("B-route", ["br_id", "br_pwd"]),
             ("MQTT", ["mqtt_host", "mqtt_port", "mqtt_user", "mqtt_pass"]),
             ("Device / Web", ["device_id", "serial_port", "poll_interval", "web_port", "web_user", "web_pass", "log_max_bytes", "adb_enabled", "pan_cache_enabled"]),
+            ("Wi-SUN Tuning", TUNING_FIELDS),
         ]
 
         sections = []
@@ -1336,8 +1395,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
                 rows.append(
                     '<label><span>{}</span><input name="{}" type="{}" value="{}"></label>'.format(
                         html_escape(label), html_escape(key), input_type, value))
-            sections.append('<div class="fieldset"><h3>{}</h3>{}</div>'.format(
-                html_escape(title), "\n".join(rows)))
+            note = ""
+            if title == "Wi-SUN Tuning":
+                note = ('<p class="muted">Leave these alone unless the meter link is '
+                        'unreliable. Longer timeouts and more retries trade responsiveness '
+                        'for tolerance of a weak signal.</p>')
+            sections.append('<div class="fieldset"><h3>{}</h3>{}{}</div>'.format(
+                html_escape(title), note, "\n".join(rows)))
 
         return """<section class="panel" data-section="config">
 <h2>Config</h2>

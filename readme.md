@@ -112,6 +112,16 @@ Web UI の OTA Update から `cube-j1-mqtt-update.zip` をアップロードす�
     "web_pass":       "cubej1",
     "log_max_bytes":  10485760,
     "adb_enabled":    true,
+    "pan_cache_enabled": true,
+    "scan_duration_start": 4,
+    "scan_duration_max": 10,
+    "join_timeout": 90,
+    "response_timeout": 15,
+    "property_map_max_retries": 3,
+    "property_map_retry_delay": 3,
+    "request_interval_ms": 0,
+    "max_consecutive_timeouts": 3,
+    "wisun_retry_delay": 60,
     "locked_mode":    false
 }
 ```
@@ -131,6 +141,24 @@ Web UI の OTA Update から `cube-j1-mqtt-update.zip` をアップロードす�
 | `log_max_bytes` | `mqtt_bridge.log` / `serial.log` のローテーションしきい値（バイト、デフォルトは `10485760` = 10MB）。上限到達時に `.1` へ退避し、旧 `.1` は削除します |
 | `adb_enabled` | ADBのネットワーク経由アクセス（TCPポート `5555`）の有効/無効（デフォルトは `true`）。本ツールはLAN内での運用を前提としているため既定で有効ですが、Web UIから無効化できます |
 | `pan_cache_enabled` | 前回接続に成功した PAN 情報（チャンネル・PAN ID・MACアドレス）を `/data/local/pan_cache.json` に保存し、次回以降の接続でPANスキャンを省略する（デフォルトは `true`）。詳細は「PAN 情報のキャッシュ」を参照 |
+
+### Wi-SUN のタイムアウト・リトライ設定
+
+電波状況が悪い環境向けに、Wi-SUN 接続まわりのタイムアウトとリトライ回数を `config.json`（および Web UI の Config → Wi-SUN Tuning）から調整できます。**すべてデフォルトのままで通常は問題ありません。** 値を大きくすると弱い電波に対する耐性は上がりますが、その分だけ異常時の復帰が遅くなります。
+
+| キー | デフォルト | 範囲 | 説明 |
+|---|---|---|---|
+| `scan_duration_start` | `4` | 2〜14 | PAN スキャン（`SKSCAN`）の最初の duration パラメータ |
+| `scan_duration_max` | `10` | 2〜14 | PAN が見つからない場合、duration を 1 ずつ増やしながらこの値まで再試行する |
+| `join_timeout` | `90` | 10〜600 | `SKJOIN` 後、PANA 接続完了（`EVENT 25`）を待つ秒数 |
+| `response_timeout` | `15` | 3〜120 | ECHONET Lite の Get に対する応答（`ERXUDP`）を待つ秒数 |
+| `property_map_max_retries` | `3` | 1〜10 | Get プロパティマップ（EPC: 9F）の取得試行回数。すべて失敗した場合は基本 EPC のみをポーリングする |
+| `property_map_retry_delay` | `3` | 0〜120 | 上記リトライの間隔（秒） |
+| `request_interval_ms` | `0` | 0〜10000 | 分割された Get リクエスト間に挿入する待ち時間（ミリ秒）。連続要求に弱いメーター向け |
+| `max_consecutive_timeouts` | `3` | 1〜50 | 応答なしがこの回数連続したら Wi-SUN を強制的に再接続する |
+| `wisun_retry_delay` | `60` | 10〜3600 | Wi-SUN 接続に失敗した場合の再試行間隔（秒） |
+
+※ `scan_duration_max` は `scan_duration_start` 以上である必要があります（保存時に検証されます）。
 | `locked_mode` | LAN外運用向けのロックモード（デフォルトは `false`）。USBインストール時にのみ設定可能で、Web UIからは変更できません。詳細は「運用環境について（LAN内 / LAN外）」を参照 |
 
 `br_id`、`br_pwd`、`mqtt_host` が未設定の場合、MQTT ブリッジはスマートメーター接続を開始せず、Web UI 上に `Configuration: required` と不足項目を表示して待機します。

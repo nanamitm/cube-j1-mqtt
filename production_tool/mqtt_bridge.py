@@ -325,16 +325,36 @@ def skcommand(fd, cmd, timeout=10):
     return lines
 
 # ---------------------------------------------------------------------------
-# Scan settings
+# Scan / retry tuning
 # ---------------------------------------------------------------------------
 
-SCAN_DURATION_BASE = 4
-SCAN_RETRY_LIMIT = 10
+# Timing and retry knobs, overridable per key from config.json. The defaults
+# reproduce exactly what these were hardcoded to before they became
+# configurable - installations with a weak link can lengthen them without
+# needing a modified mqtt_bridge.py.
+TUNING_DEFAULTS = collections.OrderedDict([
+    ("scan_duration_start",       4),    # first SKSCAN duration parameter
+    ("scan_duration_max",         10),   # give up scanning past this duration
+    ("join_timeout",              90),   # seconds to wait for EVENT 25 after SKJOIN
+    ("response_timeout",          15),   # seconds to wait for an ERXUDP reply
+    ("property_map_max_retries",  3),    # Get property map (9F) attempts
+    ("property_map_retry_delay",  3),    # seconds between those attempts
+    ("request_interval_ms",       0),    # pause between batched Get requests
+    ("max_consecutive_timeouts",  3),    # silent polls before forcing a rejoin
+    ("wisun_retry_delay",         60),   # seconds between failed join attempts
+])
+TUNING = dict(TUNING_DEFAULTS)
 
-MAX_CONSECUTIVE_TIMEOUTS = 3
-
-PROPERTY_MAP_MAX_RETRIES = 3
-PROPERTY_MAP_RETRY_DELAY = 3
+def apply_tuning(cfg):
+    for key, default in TUNING_DEFAULTS.items():
+        try:
+            TUNING[key] = int(cfg.get(key, default))
+        except Exception:
+            log("Invalid {} in config - falling back to {}".format(key, default))
+            TUNING[key] = default
+    non_default = dict((k, v) for k, v in TUNING.items() if v != TUNING_DEFAULTS[k])
+    if non_default:
+        log("Tuning overrides: {}".format(non_default))
 
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
@@ -342,9 +362,9 @@ PROPERTY_MAP_RETRY_DELAY = 3
 
 def skscan(fd):
     """Active scan with retries; returns best PAN info dict or empty dict."""
-    duration = SCAN_DURATION_BASE
-    
-    while duration <= SCAN_RETRY_LIMIT:
+    duration = TUNING["scan_duration_start"]
+
+    while duration <= TUNING["scan_duration_max"]:
         # Clear stale lines from previous command/scan cycle.
         termios.tcflush(fd, termios.TCIFLUSH)
 
@@ -482,7 +502,7 @@ def join_pan(fd, pan):
     t.daemon = True
     t.start()
     try:
-        deadline = time.time() + 90
+        deadline = time.time() + TUNING["join_timeout"]
         while time.time() < deadline:
             line = serial_readline(fd, timeout=2)
             if line is None:
@@ -814,11 +834,16 @@ def read_measurements(fd, ipv6, tid, epcs):
     what the meter answers in one frame.
     """
     props = {}
-    for batch in batch_epcs(epcs):
+    interval = TUNING["request_interval_ms"] / 1000.0
+    for index, batch in enumerate(batch_epcs(epcs)):
+        if index and interval > 0:
+            # Optional breathing room between requests; some meters answer
+            # more reliably when they aren't asked back-to-back.
+            time.sleep(interval)
         send_el_get(fd, ipv6, tid, batch)
         request_tid = tid
         tid = (tid + 1) & 0xFFFF
-        data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
+        data = read_erxudp(fd, timeout=TUNING["response_timeout"], expected_tid=request_tid)
         if data:
             props.update(parse_el_response(data))
         else:
@@ -832,11 +857,12 @@ def detect_poll_epcs(fd, ipv6, tid):
     single timeout/empty response is often transient (radio noise, a
     busy meter) rather than the meter actually lacking a property map.
     """
-    for attempt in range(1, PROPERTY_MAP_MAX_RETRIES + 1):
+    max_retries = TUNING["property_map_max_retries"]
+    for attempt in range(1, max_retries + 1):
         send_el_get(fd, ipv6, tid, [PROPERTY_MAP_EPC])
         request_tid = tid
         tid = (tid + 1) & 0xFFFF
-        data = read_erxudp(fd, timeout=15, expected_tid=request_tid)
+        data = read_erxudp(fd, timeout=TUNING["response_timeout"], expected_tid=request_tid)
         if data:
             props = parse_el_response(data)
             if PROPERTY_MAP_EPC in props:
@@ -851,16 +877,14 @@ def detect_poll_epcs(fd, ipv6, tid):
                              polling_epcs=epcs_to_hex(poll_epcs),
                              last_error="")
                 return poll_epcs, tid
-            log("Get property map unavailable (attempt {}/{})".format(
-                attempt, PROPERTY_MAP_MAX_RETRIES))
+            log("Get property map unavailable (attempt {}/{})".format(attempt, max_retries))
         else:
-            log("Get property map timeout (attempt {}/{})".format(
-                attempt, PROPERTY_MAP_MAX_RETRIES))
-        if attempt < PROPERTY_MAP_MAX_RETRIES:
-            time.sleep(PROPERTY_MAP_RETRY_DELAY)
+            log("Get property map timeout (attempt {}/{})".format(attempt, max_retries))
+        if attempt < max_retries:
+            time.sleep(TUNING["property_map_retry_delay"])
 
     log("Get property map failed after {} attempts; polling default EPCs only".format(
-        PROPERTY_MAP_MAX_RETRIES))
+        max_retries))
     write_status(gettable_epcs=[],
                  polling_epcs=epcs_to_hex(DEFAULT_EPCS),
                  last_error="Get property map failed after retries")
@@ -1512,6 +1536,7 @@ def main():
     device_id     = cfg.get("device_id", "cubej1")
     serial_port   = cfg.get("serial_port", "/dev/ttyS1")
     poll_interval = int(cfg.get("poll_interval", 60))
+    apply_tuning(cfg)
     PAN_CACHE_ENABLED = bool(cfg.get("pan_cache_enabled", PAN_CACHE_ENABLED))
     if not PAN_CACHE_ENABLED:
         # Drop any existing entry now rather than at re-enable time, so
@@ -1535,6 +1560,7 @@ def main():
                  wisun_lqi=None,
                  wisun_pan_source=None,
                  pan_cache_enabled=PAN_CACHE_ENABLED,
+                 tuning=dict(TUNING),
                  gettable_epcs=[],
                  polling_epcs=epcs_to_hex(DEFAULT_EPCS),
                  last_measurement_at=None,
@@ -1583,10 +1609,10 @@ def main():
             ipv6 = wisun_connect(fd, br_id, br_pwd)
             break
         except Exception as e:
-            log("Wi-SUN join failed: {} - retry in 60s".format(e))
+            log("Wi-SUN join failed: {} - retry in {}s".format(e, TUNING["wisun_retry_delay"]))
             write_status(wisun_connected=False,
                          last_error="Wi-SUN join failed: {}".format(e))
-            time.sleep(60)
+            time.sleep(TUNING["wisun_retry_delay"])
 
     log("Meter connected at {}".format(ipv6))
     write_status(wisun_connected=True,
@@ -1642,12 +1668,12 @@ def main():
                 else:
                     consecutive_timeouts += 1
                     log("No ERXUDP response (timeout) ({}/{})".format(
-                        consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS))
+                        consecutive_timeouts, TUNING["max_consecutive_timeouts"]))
                     write_status(last_error="No ERXUDP response (timeout)")
             finally:
                 led_rgb(*orig_led)
 
-            if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+            if consecutive_timeouts >= TUNING["max_consecutive_timeouts"]:
                 log("{} consecutive timeouts - forcing Wi-SUN reconnect".format(consecutive_timeouts))
                 try:
                     ipv6, poll_epcs, tid = reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs)
