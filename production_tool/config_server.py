@@ -1566,10 +1566,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
     def _render_status(self, status, cfg):
         gettable = ", ".join(status.get("gettable_epcs") or [])
         polling = ", ".join(status.get("polling_epcs") or [])
+        static_epcs = ", ".join(status.get("static_epcs") or [])
         if not gettable:
             gettable = "-"
         if not polling:
             polling = "-"
+        if not static_epcs:
+            static_epcs = "-"
 
         last_error = status.get("last_error") or "-"
         error_class = "bad" if last_error != "-" else "muted"
@@ -1605,10 +1608,13 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <div class="item"><span>Installation Place</span><strong>{installation_place}</strong></div>
 <div class="item"><span>Maker Code</span><strong>{maker_code}</strong></div>
 <div class="item"><span>Serial Number</span><strong>{serial_number}</strong></div>
+<div class="item"><span>Identification Number</span><strong>{identification_number}</strong></div>
+<div class="item"><span>B-route ID Number</span><strong>{broute_id_number}</strong></div>
 <div class="item"><span>Poll interval</span><strong>{poll_interval}s</strong></div>
 <div class="item"><span>Last measurement</span><strong>{last_measurement}</strong></div>
 </div>
 <p class="code">Polling EPCs: {polling}</p>
+<p class="code">Static EPCs: {static}</p>
 <p class="code">Gettable EPCs: {gettable}</p>
 <h3>Device</h3>
 <div class="grid">
@@ -1640,6 +1646,9 @@ summary {{ cursor: pointer; font-weight: 600; }}
             installation_place=self._status_value(last_values, "installation_place"),
             maker_code=self._status_value(last_values, "maker_code"),
             serial_number=self._status_value(last_values, "serial_number"),
+            identification_number=self._status_value(last_values, "identification_number"),
+            broute_id_number=self._status_value(last_values, "broute_id_number"),
+            static=html_escape(static_epcs),
             device_id=self._status_value(status, "device_id"),
             discovery=html_escape(discovery),
             meter_ipv6=self._status_value(status, "meter_ipv6"),

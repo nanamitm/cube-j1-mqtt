@@ -46,8 +46,19 @@ Home Assistant 上で以下のセンサーとしてデータを取り扱うこ�
 | 定時積算電力量（正方向）の計測日時 | EA | - | - |
 | 定時積算電力量（逆方向）の計測日時 | EB | - | - |
 
+また、接続時に一度だけ取得される「変化しない情報」として以下のセンサーも登録されます。
+
+| センサー名 | ECHONET Lite EPC | 単位 | HA device_class |
+|---|---|---|---|
+| 設置場所 | 81 | - | - |
+| 識別番号 | 83 | - | - |
+| メーカーコード | 8A | - | - |
+| 製造番号 | 8D | - | - |
+| Bルート識別番号（第2世代メーターのみ） | C0 | - | - |
+
 ※ 係数（EPC: D3）および積算電力量単位（EPC: E1）も自動で取得し、積算電力量の正確な kWh 換算に適用します。
 ※ 起動時に Get プロパティマップ（EPC: 9F）を取得し、スマートメーターが対応している追加 EPC のみを定期取得します。対応していない場合は従来の基本センサーのみ取得します。
+※ 上記の「変化しない情報」（81 / 83 / 8A / 8D / C0）は Wi-SUN 接続時に 1 回だけ取得し、retain 付きで送信します。識別番号（17バイト）と Bルート識別番号（16バイト）は 1 フレームに収まらないため、毎回のポーリングに含めると取得のたびに往復が 2 回増えてしまうためです。Home Assistant を再起動しても、retain されているため値は保持されます。
 
 ## オンデマンド取得ボタン
 
@@ -292,7 +303,7 @@ production_tool/
 - **設定 Web UI**: Python 2.7 標準ライブラリのみで実装した HTTP サーバーを `web_port` で待ち受け、Basic 認証後に `/data/local/config.json` を編集できます。
 - **ステータス表示**: MQTT ブリッジが `/data/local/mqtt_status.json` を更新し、設定 Web UI が接続状態、最終取得値、取得対象 EPC、最終エラーなどを表示します。`/status.json` から JSON としても取得できます。
 - **Wi-SUN 接続**: PAN スキャンを実行し、最も LQI（リンク品質）の良い PAN を自動選択します。選択した PAN は `/data/local/pan_cache.json` に保存され、次回以降はスキャンを省略して再接続します（失敗時は自動でフルスキャンにフォールバック）。
-- **対応 EPC の自動判定**: Get プロパティマップ（EPC: 9F）を起動時および再接続時に取得し、対応している追加項目だけをポーリング対象にします。
+- **対応 EPC の自動判定**: Get プロパティマップ（EPC: 9F）を起動時および再接続時に取得し、対応している追加項目だけをポーリング対象にします。このうち接続中に変化しない識別情報（81 / 82 / 83 / 8A / 8D / C0）はポーリング対象から外し、接続確立後に 1 回だけ取得して retain 付きで送信します。Web UI の Status パネルには `Polling EPCs` と `Static EPCs` として区別して表示されます。
 - **動作ログ**: ブリッジの動作ログは本体内の `/data/local/mqtt_bridge.log` に追記されます。`log_max_bytes`（デフォルト 10MB）を超えると `.1` へローテーションされ、ディスク使用量は最大でおよそ 2 倍に収まります（`serial.log` も同様）。
 
 ### MQTT トピック構造
@@ -320,6 +331,11 @@ production_tool/
 | 1分積算電力量の計測日時 | `cubej/{device_id}/one_minute_timestamp` |
 | 定時積算電力量（正方向）の計測日時 | `cubej/{device_id}/fixed_time_forward_timestamp` |
 | 定時積算電力量（逆方向）の計測日時 | `cubej/{device_id}/fixed_time_reverse_timestamp` |
+| 設置場所 | `cubej/{device_id}/installation_place` |
+| 識別番号 | `cubej/{device_id}/identification_number` |
+| メーカーコード | `cubej/{device_id}/maker_code` |
+| 製造番号 | `cubej/{device_id}/serial_number` |
+| Bルート識別番号 | `cubej/{device_id}/broute_id_number` |
 | ブリッジ状態 | `cubej/{device_id}/bridge_status` |
 | OTA状態 | `cubej/{device_id}/ota_status` |
 | Availability（LWT、`online`/`offline`） | `cubej/{device_id}/status` |

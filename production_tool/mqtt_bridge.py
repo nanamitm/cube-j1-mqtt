@@ -200,7 +200,8 @@ def measurement_summary(m):
             "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
             "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
             "operation_status", "fault_status", "meter_date", "meter_time",
-            "installation_place", "maker_code", "serial_number")
+            "installation_place", "maker_code", "serial_number",
+            "identification_number", "broute_id_number")
     result = {}
     for key in keys:
         if key in m:
@@ -567,7 +568,17 @@ def wisun_connect(fd, br_id, br_pwd):
 # ---------------------------------------------------------------------------
 
 DEFAULT_EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
-EXTRA_EPCS = [0x80, 0x81, 0x82, 0x88, 0x8A, 0x8D, 0x97, 0x98, 0xD0, 0xD7, 0xEA, 0xEB]
+EXTRA_EPCS = [0x80, 0x81, 0x82, 0x83, 0x88, 0x8A, 0x8D, 0x97, 0x98, 0xC0,
+              0xD0, 0xD7, 0xEA, 0xEB]
+
+# Identity properties that cannot change while the meter is joined. These are
+# read once per connection and published retained, rather than riding along
+# with every poll: 0x83 (17 bytes) and 0xC0 (16 bytes) alone exceed one
+# response frame, so polling them would cost two extra Get round-trips every
+# cycle for values that are fixed. Everything else in EXTRA_EPCS can move -
+# 0x88 raises faults, 0x97/0x98 are the meter clock - and stays in the poll.
+STATIC_EPCS = [0x81, 0x82, 0x83, 0x8A, 0x8D, 0xC0]
+
 PROPERTY_MAP_EPC = 0x9F
 MISSING_CUMULATIVE_ENERGY = 0xFFFFFFFE
 
@@ -697,6 +708,14 @@ def decode_measurements(props):
         else:
             result["fault_status"] = "unknown"
 
+    # 83: identification number (0xFE + maker code + maker-assigned unique id)
+    if 0x83 in props and len(props[0x83]) >= 1:
+        result["identification_number"] = binascii.hexlify(bytes(props[0x83])).decode("ascii").upper()
+
+    # C0: B-route identification number (2nd-generation meters)
+    if 0xC0 in props and len(props[0xC0]) >= 1:
+        result["broute_id_number"] = binascii.hexlify(bytes(props[0xC0])).decode("ascii").upper()
+
     # 8A: maker code (3-byte vendor code)
     if 0x8A in props and len(props[0x8A]) >= 1:
         result["maker_code"] = binascii.hexlify(bytes(props[0x8A])).decode("ascii").upper()
@@ -803,7 +822,8 @@ def send_el_get(fd, ipv6, tid, epcs=None):
 # properties), instead of an error for the dropped ones - so requests must
 # be split into smaller batches rather than sent as one combined Get.
 EPC_RESPONSE_BYTES = {
-    0x80: 1, 0x81: 1, 0x82: 4, 0x88: 1, 0x8A: 3, 0x8D: 12, 0x97: 2, 0x98: 4,
+    0x80: 1, 0x81: 1, 0x82: 4, 0x83: 17, 0x88: 1, 0x8A: 3, 0x8D: 12,
+    0x97: 2, 0x98: 4, 0xC0: 16,
     0xD0: 15, 0xD3: 4, 0xD7: 1, 0xE0: 4, 0xE1: 1, 0xE2: 4,
     0xE3: 4, 0xE4: 4, 0xE5: 4, 0xE7: 4, 0xE8: 4, 0xEA: 11, 0xEB: 11,
 }
@@ -851,7 +871,9 @@ def read_measurements(fd, ipv6, tid, epcs):
     return props, tid
 
 def detect_poll_epcs(fd, ipv6, tid):
-    """Get the property map and derive poll_epcs; returns (poll_epcs, tid).
+    """Get the property map; returns (poll_epcs, static_epcs, tid).
+
+    poll_epcs is read every cycle, static_epcs once per connection.
 
     Retries a few times before falling back to DEFAULT_EPCS, since a
     single timeout/empty response is often transient (radio noise, a
@@ -870,13 +892,16 @@ def detect_poll_epcs(fd, ipv6, tid):
                 log("Gettable EPCs: {}".format(format_epcs(supported)))
                 poll_epcs = list(DEFAULT_EPCS)
                 for epc in EXTRA_EPCS:
-                    if epc in supported and epc not in poll_epcs:
+                    if epc in supported and epc not in poll_epcs and epc not in STATIC_EPCS:
                         poll_epcs.append(epc)
+                static_epcs = [epc for epc in STATIC_EPCS if epc in supported]
                 log("Polling EPCs: {}".format(format_epcs(poll_epcs)))
+                log("Static EPCs (read once per connection): {}".format(format_epcs(static_epcs)))
                 write_status(gettable_epcs=epcs_to_hex(sorted(supported)),
                              polling_epcs=epcs_to_hex(poll_epcs),
+                             static_epcs=epcs_to_hex(static_epcs),
                              last_error="")
-                return poll_epcs, tid
+                return poll_epcs, static_epcs, tid
             log("Get property map unavailable (attempt {}/{})".format(attempt, max_retries))
         else:
             log("Get property map timeout (attempt {}/{})".format(attempt, max_retries))
@@ -887,10 +912,37 @@ def detect_poll_epcs(fd, ipv6, tid):
         max_retries))
     write_status(gettable_epcs=[],
                  polling_epcs=epcs_to_hex(DEFAULT_EPCS),
+                 static_epcs=[],
                  last_error="Get property map failed after retries")
-    return list(DEFAULT_EPCS), tid
+    return list(DEFAULT_EPCS), [], tid
 
-def reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs):
+def read_static_properties(mqtt, device_id, fd, ipv6, tid, static_epcs):
+    """Read the identity properties once and publish them retained.
+
+    Retained because they are only ever sent at connect time: a Home
+    Assistant restart halfway through a session would otherwise leave
+    these sensors blank until the bridge itself reconnected.
+    """
+    if not static_epcs:
+        return {}, tid
+    props, tid = read_measurements(fd, ipv6, tid, static_epcs)
+    values = decode_measurements(props)
+    if values:
+        publish_measurements(mqtt, device_id, values, retain=True)
+        log("Static properties: {}".format(measurement_summary(values)))
+    else:
+        log("Static properties: no response - continuing without them")
+    return values, tid
+
+def refresh_meter_properties(mqtt, device_id, fd, ipv6, tid, poll_epcs_ref):
+    """Re-derive what this meter supports and re-read its identity properties."""
+    poll_epcs, static_epcs, tid = detect_poll_epcs(fd, ipv6, tid)
+    sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
+    static_values, tid = read_static_properties(mqtt, device_id, fd, ipv6, tid, static_epcs)
+    return poll_epcs, static_values, tid
+
+def reconnect_wisun(mqtt, device_id, fd, br_id, br_pwd, tid, poll_epcs,
+                    static_values, poll_epcs_ref):
     """Re-join Wi-SUN and re-detect polling EPCs.
 
     Raises if wisun_connect() itself fails. If EPC re-detection fails,
@@ -902,11 +954,12 @@ def reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs):
                  meter_ipv6=ipv6,
                  last_error="")
     try:
-        poll_epcs, tid = detect_poll_epcs(fd, ipv6, tid)
+        poll_epcs, static_values, tid = refresh_meter_properties(
+            mqtt, device_id, fd, ipv6, tid, poll_epcs_ref)
     except Exception as e3:
         log("EPC detection after reconnect failed: {} - keep previous polling EPCs".format(e3))
         write_status(last_error="EPC detection after reconnect failed: {}".format(e3))
-    return ipv6, poll_epcs, tid
+    return ipv6, poll_epcs, static_values, tid
 
 def read_erxudp(fd, timeout=15, expected_tid=None):
     """Wait for ERXUDP and return payload as bytearray, or None.
@@ -1287,7 +1340,17 @@ SENSOR_DEFS = [
     ("installation_place",            "Installation Place",        None,  None,      None),
     ("maker_code",                    "Maker Code",                None,  None,      None),
     ("serial_number",                 "Serial Number",             None,  None,      None),
+    ("identification_number",         "Identification Number",     None,  None,      None),
+    ("broute_id_number",              "B-route ID Number",         None,  None,      None),
 ]
+
+# Measurement keys published as plain strings rather than formatted numbers.
+TEXT_MEASUREMENT_KEYS = (
+    "operation_status", "fault_status", "standard_version", "meter_date",
+    "meter_time", "one_minute_timestamp", "fixed_time_forward_timestamp",
+    "fixed_time_reverse_timestamp", "installation_place", "maker_code",
+    "serial_number", "identification_number", "broute_id_number",
+)
 
 # Buttons that trigger an immediate read instead of waiting out poll_interval.
 # Each is (id, label, primary EPCs, support EPCs); primary None means "whatever
@@ -1393,34 +1456,34 @@ def publish_ha_discovery(mqtt, device_id):
         mqtt.publish(topic, config, retain=True)
         log("HA discovery: {}".format(topic))
 
-def publish_measurements(mqtt, device_id, m):
+def publish_measurements(mqtt, device_id, m, retain=False):
     base = "cubej/{}".format(device_id)
+    def send(topic, value):
+        mqtt.publish("{}/{}".format(base, topic), value, retain=retain)
+
     if "power_w" in m:
-        mqtt.publish("{}/power".format(base), str(m["power_w"]))
+        send("power", str(m["power_w"]))
     if "energy_forward_kwh" in m:
-        mqtt.publish("{}/energy_forward".format(base), "{:.3f}".format(m["energy_forward_kwh"]))
+        send("energy_forward", "{:.3f}".format(m["energy_forward_kwh"]))
     if "energy_reverse_kwh" in m:
-        mqtt.publish("{}/energy_reverse".format(base), "{:.3f}".format(m["energy_reverse_kwh"]))
+        send("energy_reverse", "{:.3f}".format(m["energy_reverse_kwh"]))
     if "current_r_a" in m:
-        mqtt.publish("{}/current_r".format(base), "{:.1f}".format(m["current_r_a"]))
+        send("current_r", "{:.1f}".format(m["current_r_a"]))
     if "current_t_a" in m:
-        mqtt.publish("{}/current_t".format(base), "{:.1f}".format(m["current_t_a"]))
+        send("current_t", "{:.1f}".format(m["current_t_a"]))
     if "one_minute_energy_forward_kwh" in m:
-        mqtt.publish("{}/one_minute_energy_forward".format(base), "{:.3f}".format(m["one_minute_energy_forward_kwh"]))
+        send("one_minute_energy_forward", "{:.3f}".format(m["one_minute_energy_forward_kwh"]))
     if "one_minute_energy_reverse_kwh" in m:
-        mqtt.publish("{}/one_minute_energy_reverse".format(base), "{:.3f}".format(m["one_minute_energy_reverse_kwh"]))
+        send("one_minute_energy_reverse", "{:.3f}".format(m["one_minute_energy_reverse_kwh"]))
     if "fixed_time_energy_forward_kwh" in m:
-        mqtt.publish("{}/fixed_time_energy_forward".format(base), "{:.3f}".format(m["fixed_time_energy_forward_kwh"]))
+        send("fixed_time_energy_forward", "{:.3f}".format(m["fixed_time_energy_forward_kwh"]))
     if "fixed_time_energy_reverse_kwh" in m:
-        mqtt.publish("{}/fixed_time_energy_reverse".format(base), "{:.3f}".format(m["fixed_time_energy_reverse_kwh"]))
+        send("fixed_time_energy_reverse", "{:.3f}".format(m["fixed_time_energy_reverse_kwh"]))
     if "effective_digits" in m:
-        mqtt.publish("{}/effective_digits".format(base), str(m["effective_digits"]))
-    for key in ("operation_status", "fault_status", "standard_version", "meter_date",
-                "meter_time", "one_minute_timestamp", "fixed_time_forward_timestamp",
-                "fixed_time_reverse_timestamp", "installation_place", "maker_code",
-                "serial_number"):
+        send("effective_digits", str(m["effective_digits"]))
+    for key in TEXT_MEASUREMENT_KEYS:
         if key in m and m[key] is not None:
-            mqtt.publish("{}/{}".format(base, key), str(m[key]))
+            send(key, str(m[key]))
 
 def publish_bridge_status(mqtt, device_id):
     base = "cubej/{}".format(device_id)
@@ -1625,12 +1688,14 @@ def main():
     last_ping = time.time()
     last_status_publish = 0
     consecutive_timeouts = 0
+    static_values = {}
     try:
-        poll_epcs, tid = detect_poll_epcs(fd, ipv6, tid)
+        poll_epcs, static_values, tid = refresh_meter_properties(
+            mqtt, device_id, fd, ipv6, tid, poll_epcs_ref)
     except Exception as e:
         log("EPC detection failed: {} - polling default EPCs only".format(e))
         poll_epcs = list(DEFAULT_EPCS)
-    sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
+        sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
 
     next_action = None
     while True:
@@ -1659,8 +1724,13 @@ def main():
                                    "one_minute_energy_forward_kwh", "one_minute_energy_reverse_kwh",
                                    "fixed_time_energy_forward_kwh", "fixed_time_energy_reverse_kwh",
                                    "operation_status", "fault_status")}))
+                    # The identity properties aren't re-read every poll, so
+                    # merge the connection's copy back in - otherwise they'd
+                    # drop out of status.json and the Web UI on every cycle.
+                    reported = dict(static_values)
+                    reported.update(m)
                     write_status(last_measurement_at=now_str(),
-                                 last_values=measurement_summary(m),
+                                 last_values=measurement_summary(reported),
                                  wisun_connected=True,
                                  last_error="")
                     publish_measurements(mqtt, device_id, m)
@@ -1676,12 +1746,13 @@ def main():
             if consecutive_timeouts >= TUNING["max_consecutive_timeouts"]:
                 log("{} consecutive timeouts - forcing Wi-SUN reconnect".format(consecutive_timeouts))
                 try:
-                    ipv6, poll_epcs, tid = reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs)
+                    ipv6, poll_epcs, static_values, tid = reconnect_wisun(
+                        mqtt, device_id, fd, br_id, br_pwd, tid, poll_epcs,
+                        static_values, poll_epcs_ref)
                 except Exception as e2:
                     log("Wi-SUN reconnect after repeated timeouts failed: {}".format(e2))
                     write_status(wisun_connected=False,
                                  last_error="Wi-SUN reconnect failed: {}".format(e2))
-                sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
                 consecutive_timeouts = 0
 
             if time.time() - last_ping > 50:
@@ -1708,12 +1779,13 @@ def main():
                 log("Status publish failed: {}".format(e_pub))
             time.sleep(30)
             try:
-                ipv6, poll_epcs, tid = reconnect_wisun(fd, br_id, br_pwd, tid, poll_epcs)
+                ipv6, poll_epcs, static_values, tid = reconnect_wisun(
+                    mqtt, device_id, fd, br_id, br_pwd, tid, poll_epcs,
+                    static_values, poll_epcs_ref)
             except Exception as e2:
                 log("Wi-SUN reconnect failed: {}".format(e2))
                 write_status(wisun_connected=False,
                              last_error="Wi-SUN reconnect failed: {}".format(e2))
-            sync_poll_epcs(mqtt, device_id, poll_epcs, poll_epcs_ref)
 
 
 if __name__ == "__main__":
