@@ -15,9 +15,11 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -48,6 +50,19 @@ OTA_LOG_PATH = "/data/local/ota_apply.log"
 BRIDGE_LOG_PATH = "/data/local/mqtt_bridge.log"
 SERIAL_LOG_PATH = "/data/local/serial.log"
 PAN_CACHE_PATH = "/data/local/pan_cache.json"
+WPA_CONF_PATH = "/data/misc/wifi/wpa_supplicant.conf"
+WPA_SOCKETS = "/data/misc/wifi/sockets"
+P2P_CONTROL_SCRIPT = "/data/local/disable_p2p_ap.sh"
+
+# The factory Wi-Fi Direct AP always comes up on this address. A request whose
+# local socket address is this one arrived from a phone joined to that setup AP
+# rather than from the home LAN, and is answered with the Wi-Fi form only - the
+# AP's passphrase is a published constant, so nothing secret may cross it.
+SETUP_AP_IP = "192.168.100.1"
+SETUP_HTTP_PORT = 80
+
+# Placeholder shipped in production_tool/wpa_supplicant.conf; means "not set up".
+PLACEHOLDER_SSID = "ssid"
 AVAHI_CONF_PATH = "/system/etc/avahi-daemon.conf"
 AVAHI_SERVICE_TYPE = "_cubej1-mqtt._tcp"
 AVAHI_PUBLISH_PID_PATH = "/data/local/avahi_publish.pid"
@@ -689,6 +704,255 @@ def restart_bridge():
     log("restart_bridge rc={}".format(rc))
 
 
+def read_wifi_ssid():
+    """SSID currently in wpa_supplicant.conf, or "" when unconfigured.
+
+    The stored PSK is deliberately never read back: it would end up in an
+    HTML value attribute, and the setup page is served over an AP whose
+    passphrase is public.
+    """
+    try:
+        with open(WPA_CONF_PATH) as f:
+            text = f.read()
+    except Exception:
+        return ""
+    m = re.search(r'^\s*ssid="(.*)"\s*$', text, re.MULTILINE)
+    if not m:
+        return ""
+    ssid = m.group(1)
+    return "" if ssid == PLACEHOLDER_SSID else ssid
+
+
+def wifi_is_configured():
+    return bool(read_wifi_ssid())
+
+
+def validate_wifi(ssid, psk):
+    """Check credentials before they are written into wpa_supplicant.conf.
+
+    wpa_supplicant.conf is line-oriented, so a value containing a newline or a
+    quote lets the caller close the network block and append arbitrary
+    directives - including ctrl_interface, which would hand over a control
+    socket. Stripping quotes alone (as the fork this was modelled on does) does
+    not close that: the newline is what matters.
+    """
+    errors = []
+    if not ssid:
+        errors.append("SSID must not be empty")
+    if any(ch in ssid for ch in ('"', "\\", "\n", "\r")):
+        errors.append('SSID must not contain quotes, backslashes or line breaks')
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in ssid):
+        errors.append("SSID must not contain control characters")
+    # wpa_supplicant stores the SSID as at most 32 bytes, not 32 characters.
+    if len(ssid.encode("utf-8")) > 32:
+        errors.append("SSID must be 32 bytes or less")
+
+    if psk:
+        if any(ch in psk for ch in ('"', "\\", "\n", "\r")):
+            errors.append('Password must not contain quotes, backslashes or line breaks')
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in psk):
+            errors.append("Password must not contain control characters")
+        if not (8 <= len(psk) <= 63):
+            errors.append("Password must be between 8 and 63 characters (WPA-PSK)")
+    return errors
+
+
+def write_wifi(ssid, psk):
+    """Replace the network block in wpa_supplicant.conf, keeping the rest.
+
+    Not a wholesale rewrite: the file also carries ctrl_interface,
+    update_config and p2p_disabled, and dropping p2p_disabled would silently
+    bring the factory AP back on the next boot.
+    """
+    lines = []
+    try:
+        with open(WPA_CONF_PATH) as f:
+            lines = f.read().splitlines()
+    except Exception as e:
+        log("wpa_supplicant.conf read failed: {}".format(e))
+
+    kept = []
+    depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if depth == 0 and stripped.startswith("network=") and stripped.endswith("{"):
+            depth = 1
+            continue
+        if depth:
+            if stripped == "}":
+                depth = 0
+            continue
+        kept.append(line)
+
+    if not any(l.strip().startswith("ctrl_interface=") for l in kept):
+        kept.insert(0, "ctrl_interface=" + WPA_SOCKETS)
+    if not any(l.strip().startswith("update_config=") for l in kept):
+        kept.insert(1, "update_config=1")
+
+    while kept and not kept[-1].strip():
+        kept.pop()
+
+    if psk:
+        block = ['network={',
+                 '        ssid="{}"'.format(ssid),
+                 '        psk="{}"'.format(psk),
+                 '        key_mgmt=WPA-PSK',
+                 '}']
+    else:
+        block = ['network={',
+                 '        ssid="{}"'.format(ssid),
+                 '        key_mgmt=NONE',
+                 '}']
+
+    text = "\n".join(kept + [""] + block) + "\n"
+
+    directory = os.path.dirname(WPA_CONF_PATH)
+    fd, tmp_path = tempfile.mkstemp(prefix=".wpa.", suffix=".conf", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.rename(tmp_path, WPA_CONF_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+    os.system("chmod 660 {}".format(shell_quote(WPA_CONF_PATH)))
+    os.system("chown system:wifi {}".format(shell_quote(WPA_CONF_PATH)))
+    # Relaxed umask for the same reason as get_wifi_status(): wpa_supplicant
+    # runs as another user and must be able to reply on the control socket.
+    old_umask = os.umask(0)
+    try:
+        os.system("wpa_cli -p {} -i wlan0 reconfigure >/dev/null 2>&1".format(shell_quote(WPA_SOCKETS)))
+    finally:
+        os.umask(old_umask)
+    log("wifi credentials written for ssid={!r}".format(ssid))
+
+
+def wait_for_wifi(timeout=45):
+    """Poll wpa_supplicant until association completes. True if it did."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (get_wifi_status() or {}).get("ip_address"):
+            return True
+        time.sleep(3)
+    return False
+
+
+def apply_p2p_policy():
+    """Re-run the boot-time AP decision now that the Wi-Fi config changed."""
+    rc = os.system("/system/bin/sh {} >/dev/null 2>&1 &".format(shell_quote(P2P_CONTROL_SCRIPT)))
+    log("apply_p2p_policy rc={}".format(rc))
+
+
+# Probe URLs phones fetch to decide whether a network reaches the internet.
+# Answering with a redirect (rather than the 204/expected body) is what makes
+# Android and iOS treat this as a captive portal and offer to open the page,
+# instead of marking the network dead and quietly using mobile data - which is
+# what made the setup page unreachable when this was first tested by hand.
+CAPTIVE_PORTAL_PATHS = frozenset([
+    "/generate_204", "/gen_204",                      # Android
+    "/hotspot-detect.html", "/library/test/success.html",  # iOS / macOS
+    "/connecttest.txt", "/ncsi.txt",                  # Windows
+    "/success.txt", "/canonical.html",                # Firefox
+])
+
+_setup_httpd = None
+_setup_httpd_lock = threading.Lock()
+
+
+def stop_nginx():
+    # The OEM's nginx owns 0.0.0.0:80, so the setup portal cannot bind
+    # 192.168.100.1:80 until it lets go.
+    rc = os.system("stop nginx >/dev/null 2>&1")
+    log("stop nginx rc={}".format(rc))
+
+
+def start_nginx():
+    rc = os.system("start nginx >/dev/null 2>&1")
+    log("start nginx rc={}".format(rc))
+
+
+def setup_ap_address_exists():
+    """True once p2p-wlan0-0 actually holds SETUP_AP_IP.
+
+    Probed by binding an ephemeral port on that address, which says whether
+    the address is assigned without competing for port 80.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind((SETUP_AP_IP, 0))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def serve_setup_portal():
+    """Run the port-80 setup portal for as long as Wi-Fi stays unconfigured.
+
+    On its own thread because config_server starts well before the OEM has
+    brought up p2p-wlan0-0 at boot, and binding an address that does not exist
+    yet simply fails.
+    """
+    global _setup_httpd
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if wifi_is_configured():
+            log("setup portal: Wi-Fi already configured, not starting")
+            return
+        if setup_ap_address_exists():
+            break
+        time.sleep(5)
+    else:
+        log("setup portal: {} never appeared, giving up".format(SETUP_AP_IP))
+        return
+
+    stop_nginx()
+    time.sleep(1)
+    try:
+        httpd = ThreadingHTTPServer((SETUP_AP_IP, SETUP_HTTP_PORT), ConfigHandler)
+    except Exception as e:
+        log("setup portal bind failed: {} - restoring nginx".format(e))
+        start_nginx()
+        return
+
+    httpd.config = load_config()
+    with _setup_httpd_lock:
+        _setup_httpd = httpd
+    log("setup portal listening on {}:{}".format(SETUP_AP_IP, SETUP_HTTP_PORT))
+    try:
+        httpd.serve_forever()
+    finally:
+        log("setup portal stopped")
+
+
+def stop_setup_portal():
+    """Tear the portal down and hand port 80 back to nginx."""
+    global _setup_httpd
+    with _setup_httpd_lock:
+        httpd, _setup_httpd = _setup_httpd, None
+    if httpd is None:
+        return
+    # shutdown() blocks until serve_forever() returns, and this is called from
+    # inside a request handler of that very server, so it has to run elsewhere.
+    def closer():
+        try:
+            httpd.shutdown()
+            httpd.server_close()
+        except Exception as e:
+            log("setup portal shutdown failed: {}".format(e))
+        start_nginx()
+    t = threading.Thread(target=closer)
+    t.daemon = True
+    t.start()
+
+
 def clear_pan_cache():
     # The bridge re-joins from the cached PAN instead of scanning, so a
     # "Rescan Wi-SUN" that only restarted the bridge would rejoin the exact
@@ -889,7 +1153,55 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _via_setup_ap(self):
+        """True when this request arrived on the factory setup AP.
+
+        Keyed on the local address the connection landed on, so it holds for
+        both the port-80 portal and anyone reaching 8080 over the same AP.
+        """
+        try:
+            return self.connection.getsockname()[0] == SETUP_AP_IP
+        except Exception:
+            return False
+
+    def _redirect_to_setup(self):
+        self.send_response(302)
+        self.send_header("Location", "http://{}/".format(SETUP_AP_IP))
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _setup_only(self):
+        self._send(403,
+                   "Only Wi-Fi setup is available over the setup access point.\n"
+                   "Connect to the home network and use http://<device-ip>:8080/ "
+                   "for everything else.\n",
+                   "text/plain; charset=utf-8")
+
+    def _handle_setup_get(self, path):
+        # Probes are answered before auth: they must be, and a redirect
+        # discloses nothing.
+        if path in CAPTIVE_PORTAL_PATHS:
+            self._redirect_to_setup()
+            return
+        if path not in ("/", "/index.html"):
+            self._setup_only()
+            return
+        # Authenticated even though the page itself holds no secrets: an
+        # unauthenticated form would let anyone in radio range point the device
+        # at their own AP, and from there the full Web UI - B-route ID and
+        # password, MQTT password - lands on a network they control.
+        if not self._require_auth():
+            return
+        self._send(200, self._render_setup_page())
+
     def do_GET(self):
+        if self._via_setup_ap():
+            self._handle_setup_get(self.path.split("?", 1)[0])
+            return
+        return self._do_get_main()
+
+    def _do_get_main(self):
         if self.path == "/status.json":
             if not self._require_auth():
                 return
@@ -932,6 +1244,21 @@ class ConfigHandler(BaseHTTPRequestHandler):
         self._send(200, self._render_form())
 
     def do_POST(self):
+        if self._via_setup_ap():
+            if self.path.split("?", 1)[0] != "/wifi/save":
+                self._setup_only()
+                return
+            if not self._require_auth():
+                return
+            self._handle_wifi_save(from_setup_ap=True)
+            return
+        if self.path == "/wifi/save":
+            if not self._require_auth():
+                return
+            if self._reject_locked():
+                return
+            self._handle_wifi_save(from_setup_ap=False)
+            return
         if self.path == "/ota/upload":
             if not self._require_auth():
                 return
@@ -1016,6 +1343,126 @@ class ConfigHandler(BaseHTTPRequestHandler):
         except Exception as e:
             log("save failed: {}".format(e))
             self._send(500, self._render_form(errors=[str(e)], message="Save failed", active_section=active_section))
+
+    def _handle_wifi_save(self, from_setup_ap):
+        params = parse_post_params(self)
+        ssid = params.get("wifi_ssid", [""])[0]
+        psk = params.get("wifi_psk", [""])[0]
+
+        def fail(errors):
+            if from_setup_ap:
+                self._send(400, self._render_setup_page(errors=errors))
+            else:
+                self._send(400, self._render_form(errors=errors,
+                                                  message="Wi-Fi save failed",
+                                                  active_section="config"))
+
+        errors = validate_wifi(ssid, psk)
+        if errors:
+            fail(errors)
+            return
+        try:
+            write_wifi(ssid, psk)
+        except Exception as e:
+            log("wifi save failed: {}".format(e))
+            fail([str(e)])
+            return
+
+        connected = wait_for_wifi()
+        ip_address = (get_wifi_status() or {}).get("ip_address", "")
+
+        if connected:
+            message = ("Connected to {}. The device is now reachable at "
+                       "http://{}:8080/ on your home network.").format(ssid, ip_address or "<device-ip>")
+        else:
+            message = ("Saved, but the device has not associated with {} yet. "
+                       "Check the password and the 2.4GHz band, then try again."
+                       ).format(ssid)
+
+        # Respond before touching the AP: on a success from the setup AP the
+        # next step tears down the very link this reply travels over.
+        if from_setup_ap:
+            self._send(200, self._render_setup_page(message=message, done=connected))
+        else:
+            self._send(200, self._render_form(message=message, active_section="config"))
+
+        if connected:
+            apply_p2p_policy()
+            if from_setup_ap:
+                stop_setup_portal()
+
+    def _render_setup_page(self, message=None, errors=None, done=False):
+        current = read_wifi_ssid()
+        error_html = ""
+        if errors:
+            error_html = '<div class="error">' + "<br>".join(html_escape(e) for e in errors) + "</div>"
+        message_html = '<div class="message">{}</div>'.format(html_escape(message)) if message else ""
+
+        if done:
+            form_html = ('<p>Setup is complete. This access point is shutting down, so this '
+                         'page will stop responding in a moment - that is expected.</p>')
+        else:
+            form_html = """<form method="post" action="/wifi/save">
+<label><span>Wi-Fi SSID (2.4GHz only)</span><input name="wifi_ssid" type="text" value="{ssid}" autocapitalize="none" autocorrect="off" required></label>
+<label><span>Wi-Fi Password (leave empty for an open network)</span><input name="wifi_psk" type="password" autocapitalize="none" autocorrect="off"></label>
+<div class="actions"><button type="submit">Connect</button></div>
+<p class="muted">Connecting can take up to a minute. The device's LED turns green once it joins.</p>
+</form>""".format(ssid=html_escape(current))
+
+        return """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cube J1 Wi-Fi Setup</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #f4f6f8; color: #202124; }}
+main {{ max-width: 520px; margin: 0 auto; padding: 24px 18px; }}
+h1 {{ font-size: 21px; margin: 0 0 4px; }}
+.subtitle {{ color: #5f6368; font-size: 13px; margin-bottom: 18px; }}
+.panel {{ background: #fff; border: 1px solid #d8dde3; border-radius: 8px; padding: 18px; }}
+label {{ display: grid; gap: 6px; margin: 14px 0; }}
+label span {{ color: #5f6368; font-size: 13px; }}
+input {{ width: 100%; font-size: 16px; padding: 10px; border: 1px solid #b9c0c8; border-radius: 4px; }}
+.actions {{ margin-top: 18px; }}
+button {{ font-size: 16px; padding: 11px 20px; width: 100%; border: 1px solid #2f6fed; border-radius: 4px; background: #2f6fed; color: #fff; }}
+.muted {{ color: #5f6368; font-size: 13px; line-height: 1.5; }}
+.message {{ background: #e6f4ea; border: 1px solid #9ad0a6; border-radius: 6px; padding: 10px; margin-bottom: 12px; }}
+.error {{ background: #fce8e6; border: 1px solid #f2a39b; border-radius: 6px; padding: 10px; margin-bottom: 12px; }}
+.note {{ margin-top: 16px; }}
+</style>
+</head>
+<body>
+<main>
+<h1>Cube J1 Wi-Fi Setup</h1>
+<div class="subtitle">Connected over the setup access point</div>
+{message}{errors}
+<div class="panel">
+{form}
+</div>
+<p class="muted note">Only Wi-Fi setup is available here. Meter, MQTT and log
+screens stay on the home network at <code>http://&lt;device-ip&gt;:8080/</code>,
+because this access point uses a fixed, publicly known passphrase.</p>
+</main>
+</body>
+</html>
+""".format(message=message_html, errors=error_html, form=form_html)
+
+    def _render_wifi_panel(self):
+        current = read_wifi_ssid()
+        state = html_escape(current) if current else "not configured"
+        return """<div class="fieldset">
+<h3>Wi-Fi</h3>
+<p class="muted">Current network: <strong>{state}</strong>. Changing this reconnects the
+device; if the new credentials are wrong it becomes unreachable and the factory
+setup access point comes back on the next boot.</p>
+<form method="post" action="/wifi/save#config" onsubmit="return confirm('Reconnect the device to this Wi-Fi network now?');">
+<label><span>Wi-Fi SSID (2.4GHz only)</span><input name="wifi_ssid" type="text" value="{ssid}" autocapitalize="none"></label>
+<label><span>Wi-Fi Password (leave empty for an open network)</span><input name="wifi_psk" type="password" autocapitalize="none"></label>
+<div class="actions"><button type="submit" class="secondary">Save Wi-Fi</button></div>
+</form>
+</div>""".format(state=state, ssid=html_escape(current))
 
     def _handle_config_import(self):
         try:
@@ -1415,7 +1862,8 @@ summary {{ cursor: pointer; font-weight: 600; }}
 <label><input type="checkbox" name="restart_bridge" value="1" checked> Restart MQTT bridge</label>
 </div>
 </form>
-</section>""".format(sections="\n".join(sections))
+{wifi}
+</section>""".format(sections="\n".join(sections), wifi=self._render_wifi_panel())
 
     def _status_value(self, status, key, default="-"):
         value = status.get(key, default)
@@ -1681,6 +2129,17 @@ def main():
     cfg = load_config()
     port = int(cfg.get("web_port", 8080))
     sync_avahi(cfg)
+
+    # With no home network configured the factory AP is left up as a setup AP
+    # (see disable_p2p_ap.sh); serve the Wi-Fi form on port 80 there so a phone
+    # only has to open http://192.168.100.1/ - the OEM's nginx answering 404 on
+    # that port is otherwise a very convincing dead end.
+    if not wifi_is_configured():
+        log("no Wi-Fi configured - starting setup portal thread")
+        t = threading.Thread(target=serve_setup_portal)
+        t.daemon = True
+        t.start()
+
     httpd = ThreadingHTTPServer(("0.0.0.0", port), ConfigHandler)
     httpd.config = cfg
     log("config server start port={}".format(port))

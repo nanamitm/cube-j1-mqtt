@@ -27,14 +27,20 @@ chmod 755 /data/local/led_effect.sh
 wpa_cli -p /data/misc/wifi/sockets -i wlan0 reconfigure
 
 # ── Blink blue until Wi-Fi association completes (give up after ~5 min) ───────
-i=0
-while [ $i -lt 500 ]; do
-    if wpa_cli -p /data/misc/wifi/sockets -i wlan0 status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
-        break
-    fi
-    /data/local/led_effect.sh blink blue 1
-    i=$((i + 1))
-done
+# Skipped when wpa_supplicant.conf still carries the placeholder SSID: there is
+# nothing to associate with, and burning 5 minutes here would only delay the
+# setup AP that the user needs in order to enter their credentials.
+CONFIGURED_SSID=$(sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' /data/misc/wifi/wpa_supplicant.conf 2>/dev/null | head -n 1)
+if [ -n "$CONFIGURED_SSID" ] && [ "$CONFIGURED_SSID" != "ssid" ]; then
+    i=0
+    while [ $i -lt 500 ]; do
+        if wpa_cli -p /data/misc/wifi/sockets -i wlan0 status 2>/dev/null | grep -q '^wpa_state=COMPLETED$'; then
+            break
+        fi
+        /data/local/led_effect.sh blink blue 1
+        i=$((i + 1))
+    done
+fi
 
 # ── Install MQTT bridge (persistent, survives USB removal) ────────────────────
 
@@ -65,8 +71,8 @@ cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
 # install config web UI as an init service
 cp $PT/config_server.rc /system/etc/init/cubej_web_ui.rc
 
-# install P2P/AP disabler as an init service (auto-runs on every boot,
-# the factory CubeJ-xxxxxx AP has no usable credentials - see disable_p2p_ap.sh)
+# install the factory P2P/AP controller as an init service (runs on every boot
+# and decides whether the CubeJ-xxxxxx AP stays up - see disable_p2p_ap.sh)
 cp $PT/disable_p2p_ap.rc /system/etc/init/disable_p2p_ap.rc
 
 # ── Stop conflicting services immediately ──────────────────────────────────────
@@ -74,7 +80,9 @@ stop wisund
 stop NDEcLiteAgent
 sleep 2
 
-# ── Stop the factory P2P/AP now (init service handles future boots) ───────────
+# ── Decide the factory P2P/AP now (init service handles future boots) ─────────
+# Stops it when a home network is configured; leaves it up as the setup AP when
+# wpa_supplicant.conf was left with the placeholder SSID.
 /system/bin/sh /data/local/disable_p2p_ap.sh
 
 # ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───
