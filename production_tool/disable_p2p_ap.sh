@@ -4,11 +4,17 @@
 # Only targets p2p-wlan0-0 and its dedicated dnsmasq; the regular home
 # Wi-Fi connection on wlan0 is left untouched.
 #
-# This AP's WPA2 passphrase is derived from an OEM-encrypted Android
-# property (ro.default.p2p.pwd.enc.b64) we have no key for, so it can't
-# be joined by anything we control and serves no purpose for this
-# bridge - disable it rather than leave it broadcasting with no usable
-# credentials.
+# This AP's WPA2 passphrase is the fixed value "12345678" (verified on a
+# real device 2026-08-02). An earlier version of this comment claimed the
+# passphrase was unobtainable because it derives from an OEM-encrypted
+# property (ro.default.p2p.pwd.enc.b64); that was an inference nobody had
+# tested, and it was wrong.
+#
+# The AP is still disabled, for the opposite reason: a permanently
+# broadcasting AP whose passphrase is a published constant puts anything
+# reachable over it - this bridge's Web UI, with the B-route credentials
+# and MQTT password in it, and ADB on 5555 - in reach of anyone within
+# radio range.
 
 LOG=/data/local/cubej1_p2p_ap.log
 WPA_CONF=/data/misc/wifi/wpa_supplicant.conf

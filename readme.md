@@ -272,7 +272,7 @@ USB メモリ挿入時に Cube J1 が自動実行するメインスクリプト�
 4. **競合サービスの停止**: Wi-SUN モジュール（`/dev/ttyS1`）を占有してしまう既存サービス（`wisund`、`NDEcLiteAgent`）を停止し、以後の起動を無効化
 5. **init サービスの登録**: 再起動後もプログラムが自動起動するよう、`mqtt_ha_bridge.rc`・`config_server.rc`・`disable_p2p_ap.rc` を `/system/etc/init/` へ配置
 6. **ブリッジと設定 Web UI の即時起動**: `mqtt_ha_bridge` サービスとして `mqtt_bridge.py`、`cubej_web_ui` サービスとして `config_server.py` を起動開始
-7. **工場出荷時 P2P/AP の停止**: 初期設定用と思われる Wi-Fi Direct/P2P AP（`CubeJ-xxxxxx`）を `disable_p2p_ap.sh` で停止。このAPのWPA2パスフレーズは NextDrive 側で暗号化されたプロパティに由来し本ツールからは利用できないため、無効化しています（`disable_p2p_ap` サービスとして以後の起動時も停止し続けます）
+7. **工場出荷時 P2P/AP の停止**: 初期設定用と思われる Wi-Fi Direct/P2P AP（`CubeJ-xxxxxx`）を `disable_p2p_ap.sh` で停止（`disable_p2p_ap` サービスとして以後の起動時も停止し続けます）。このAPのWPA2パスフレーズは **`12345678` という固定値**であり、常時発信したままにすると電波の届く範囲の第三者が本体のWeb UI（Bルート認証情報とMQTTパスワードを含む）やADB（ポート`5555`）へ到達できてしまうため、既定で無効化しています
 8. **完了通知**: `led_effect.sh` を呼び出し、LED を点滅させてセットアップ完了を通知
 
 ### ファイル構成
